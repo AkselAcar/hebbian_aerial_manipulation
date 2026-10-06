@@ -10,3 +10,9 @@ profile.sh
 *.sqlite3
 *.db
 reference_trajectories/
+
+# hebbian experiment outputs
+logs/
+results/
+*.out
+__pycache__/

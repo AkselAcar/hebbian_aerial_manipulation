@@ -305,6 +305,7 @@ class MARLHoverEnv(DirectMARLEnv):
         # other-drone_states
         # goal terms
 
+        # load state of the payload
         self.load_position[:] = (
             self.robot.data.body_com_state_w.torch[:, self._payload_idx, :3].squeeze(1) - self.scene.env_origins
         )
@@ -312,6 +313,7 @@ class MARLHoverEnv(DirectMARLEnv):
         self.load_vel[:] = self.robot.data.body_com_state_w.torch[:, self._payload_idx, 7:10].squeeze(1)
         self.load_ang_vel[:] = self.robot.data.body_com_state_w.torch[:, self._payload_idx, 10:13].squeeze(1)
 
+        # load state of the drones
         self.drone_positions[:] = self.robot.data.body_com_state_w.torch[
             :, self._falcon_idx, :3
         ] - self.scene.env_origins.unsqueeze(1)

@@ -118,6 +118,9 @@ class MARLHoverEnvCfg(DirectMARLEnvCfg):
         obs_dim_geo = 87
         observation_spaces = {"falcon1": obs_dim_geo, "falcon2": obs_dim_geo, "falcon3": obs_dim_geo}
         state_space = 84
+        # total number of actions and observations for all agents
+        # total_action_space = action_dim_geo * num_drones
+        # total_observation_space = obs_dim_geo * num_drones
     elif control_mode == "ACCBR":
         action_dim_accbr = 5
         action_spaces = {"falcon1": action_dim_accbr, "falcon2": action_dim_accbr, "falcon3": action_dim_accbr}
