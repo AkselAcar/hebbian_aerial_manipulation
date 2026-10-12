@@ -6,7 +6,7 @@
 #SBATCH -c 8
 #SBATCH --mem=16G
 #SBATCH --time=09:00:00
-#SBATCH -J hebbian_cmaes_alive_pop100_reps3
+#SBATCH -J hebbian_cmaes_w_abcd_pop100_reps3
 #SBATCH -o logs/%x_%j.out
 
 REPO=$HOME/lis_semester_project/MARL_cooperative_aerial_manipulation_ext
@@ -20,5 +20,5 @@ apptainer exec --nv \
   "$SIF" \
   /bin/bash -c "
     export PYTHONPATH=/workspace/project/exts/MARL_mav_carry_ext:\$PYTHONPATH
-    /workspace/isaaclab/_isaac_sim/python.sh /workspace/project/scripts/hebbian/train_hebbian.py --headless --pop_size=100 --n_reps=3 --n_generations=2000 --episode_steps=2000
+    /workspace/isaaclab/_isaac_sim/python.sh /workspace/project/scripts/hebbian/train_hebbian.py --headless --pop_size=100 --n_reps=3 --n_generations=2000 --episode_steps=2000 --genome=w_abcd
   "

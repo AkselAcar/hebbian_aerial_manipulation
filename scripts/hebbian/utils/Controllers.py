@@ -446,11 +446,20 @@ class hebbianNNController(Controller):
         return control_input
 
     def geno2pheno(self, genotype: np.array):
-        abcd = np.array(genotype).reshape(4, self.A.size)
-        self.A = np.array(abcd[0, :])
-        self.B = np.array(abcd[1, :])
-        self.C = np.array(abcd[2, :])
-        self.D = np.array(abcd[3, :])
+        g = np.array(genotype, dtype=float)  # a copy, so Hebbian updates never touch the CMA-ES population
+        n = self.A.size            # number of synapses (1139)
+        n1 = self.weights_l1.size  # 765
+        n2 = self.weights_l2.size  # 289
+
+        # first n values: the starting weights, layer by layer
+        self.weights_l1 = g[:n1].reshape(self.weights_l1.shape)
+        self.weights_l2 = g[n1:n1 + n2].reshape(self.weights_l2.shape)
+        self.weights_out = g[n1 + n2:n].reshape(self.weights_out.shape)
+
+        # remaining 4n values: one A, B, C and D per synapse
+        self.A, self.B, self.C, self.D = g[n:].reshape(4, n)
+    
+    
 
     def load_geno(self, path: str):
         genotype = np.load(path + "/ABCD.npy", allow_pickle=True)

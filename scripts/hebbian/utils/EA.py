@@ -113,7 +113,10 @@ class CMAes(EA):
         # self.F = params['F']  # Mutation factor
         self.bounds = params['bounds']  # lower/upper bound on design variables
 
-        solution_seed = np.random.uniform(self.bounds[0], self.bounds[1], self.D) / 5
+        if 'x0' in params:  # start point chosen by the training script
+            solution_seed = np.asarray(params['x0'], dtype=float)
+        else:               # old behaviour: random start in [-1, 1]
+            solution_seed = np.random.uniform(self.bounds[0], self.bounds[1], self.D) / 5        
         self.f_new = np.empty(self.Np)
 
         opts = {

@@ -1,280 +1,286 @@
 #!/usr/bin/env python3
-"""Plot training progress from train_hebbian.py's generation_log*.csv.
+"""Plot training progress from train_hebbian.py's generation_log_<jobid>.csv.
 
-Usage (on the cluster, or locally after copying the CSV over):
+Usage (from the project folder, where logs/ is):
+
     python3 plot_hebbian_training.py
-        -> with no --csv, auto-finds the most recently modified
-           generation_log*.csv in ./logs (or the current directory) and
-           uses that. This is the normal way to run it: after a job
-           finishes (or while it's still running), just run this with no
-           arguments and it plots your latest run.
-    python3 plot_hebbian_training.py --csv logs/generation_log_3194838.csv
-        -> plot a specific run by its SLURM job id (see train_hebbian.py's
-           per-run CSV naming) instead of the newest one -- e.g. to look
-           back at an older attempt.
-    python3 plot_hebbian_training.py --all-runs
-        -> if you point --csv at an OLD-style log that has multiple runs
-           appended into one file, overlay all of them instead of just
-           the latest.
+        -> plots the most recent logs/generation_log_*.csv
+    python3 plot_hebbian_training.py --csv logs/generation_log_3215600.csv
+        -> plots one specific run
+    python3 plot_hebbian_training.py --compare logs/generation_log_3205173.csv logs/generation_log_3215600.csv \
+                                     --labels "ABCD only" "weights + ABCD"
+        -> overlays several runs on the same axes (survival, best fitness, ...)
 
-Needs only matplotlib (pip install --user matplotlib) -- CSV parsing uses the
-standard library, on purpose, so you don't need pandas or any cluster module
-you don't already have.
+Output: a PNG next to where you run it, named after the job id
+(training_progress_<jobid>.png, or comparison_<id1>_<id2>.png).
+A short text summary is printed as well.
 
---------------------------------------------------------------------------
-Why this exists / what it plots
---------------------------------------------------------------------------
-Fuda's feedback on the first (flat) curve was: "I would also plot the
-standard deviation of the fitness, and mean variance of your genotype."
-This script produces exactly those, alongside the fitness curve itself:
+Works with old and new CSVs: panels whose column is missing from a log
+(e.g. sat_frac in a run from before it was added) are shown as "not logged".
 
-    Panel 1 - fitness per generation: best genome (line) and population
-              mean (line), with the +/- 1 std band shaded around the mean.
-              This is the "is it learning" plot, now with the spread Fuda
-              asked for instead of just a single flat-looking line.
-    Panel 2 - fitness standard deviation per generation, on its own axis
-              (the shaded band in panel 1 shows this too, but Fuda asked
-              for it explicitly as its own plot, so it's broken out here).
-    Panel 3 - mean genotype variance per generation. A shrinking value
-              here means CMA-ES's search distribution is narrowing
-              (converging); if it stays flat/high, the population isn't
-              settling on anything.
-    Panel 4 (bonus, not explicitly requested but explains 2 and 3
-              together) - CMA-ES's sigma (its own internal step size).
-              Sigma and genotype variance should decay together as the
-              search converges; if they diverge, something's off.
-
---------------------------------------------------------------------------
-Handling multiple runs in one log file
---------------------------------------------------------------------------
-train_hebbian.py opens the CSV in *append* mode, so if you stop a job and
-resubmit, the new run's "generation 0" gets appended right after the old
-run's last row -- the generation column just resets partway through the
-file. This script detects those resets (a generation number that drops
-back down) and splits the log into separate runs. By default it plots
-only the LAST (most recent) run, since that's almost always what you
-want; pass --all-runs to overlay every run instead (useful for comparing
-attempts against each other).
+Needs only matplotlib (pip install --user matplotlib).
 """
 
-from __future__ import annotations  # lets str | None / list[dict] hints work on Python < 3.10
+from __future__ import annotations
 
 import argparse
 import csv
-import datetime
 import glob
 import os
 
 import matplotlib
 
-matplotlib.use("Agg")  # write straight to a file; no display/X11 needed over SSH
+matplotlib.use("Agg")  # write straight to a file, no display needed over SSH
 import matplotlib.pyplot as plt
 
-# Okabe-Ito colorblind-safe palette (fixed assignment, not cycled).
-COLOR_BEST = "#D55E00"      # vermillion
-COLOR_MEAN = "#0072B2"      # blue
-COLOR_STD_BAND = "#0072B2"  # same hue as mean, used at low alpha
-COLOR_STD_LINE = "#D55E00"  # vermillion, panel 2
-COLOR_VARIANCE = "#009E73"  # bluish green
-COLOR_SIGMA = "#CC79A7"     # reddish purple
+# Fixed categorical colors (assigned in this order, never cycled).
+C1 = "#2a78d6"  # blue
+C2 = "#eb6834"  # orange
+C3 = "#1baf7a"  # aqua
+C4 = "#eda100"  # yellow
+C5 = "#e87ba4"  # magenta
+C6 = "#008300"  # green
+C7 = "#6250d6"  # violet
+C8 = "#e34948"  # red
+SERIES = [C1, C2, C3, C4, C5, C6, C7, C8]
+INK = "#4a4a48"     # axis text
+GRID = "#d9d8d4"    # recessive grid
 
-FIELDS = ["generation", "fitness_mean", "fitness_std", "fitness_best",
-          "genome_variance_mean", "cma_sigma", "seconds"]
+plt.rcParams.update({
+    "axes.edgecolor": GRID, "axes.labelcolor": INK, "axes.titlecolor": "#1f1f1e",
+    "axes.titlesize": 10, "axes.labelsize": 9, "xtick.color": INK, "ytick.color": INK,
+    "xtick.labelsize": 8, "ytick.labelsize": 8, "legend.fontsize": 8, "legend.frameon": False,
+    "axes.spines.top": False, "axes.spines.right": False,
+})
 
 
-def load_rows(csv_path: str) -> list[dict]:
-    """Read generation_log.csv into a list of dicts with float values."""
-    rows = []
+# ---------------------------------------------------------------- loading
+def load(csv_path: str) -> dict[str, list[float]]:
+    """Read the CSV into {column: [values per generation]}. Non-numeric cells are skipped."""
+    cols: dict[str, list[float]] = {}
     with open(csv_path, newline="") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            rows.append({k: float(r[k]) for k in FIELDS})
-    return rows
+        for row in csv.DictReader(f):
+            for k, v in row.items():
+                try:
+                    cols.setdefault(k, []).append(float(v))
+                except (TypeError, ValueError):
+                    pass
+    return cols
 
 
-def split_into_runs(rows: list[dict]) -> list[list[dict]]:
-    """Split an append-mode log into separate runs.
-
-    A new run starts wherever `generation` does not strictly increase
-    from the previous row (i.e. it dropped back to 0, or to some other
-    value <= the row before it).
-    """
-    runs = []
-    start = 0
-    for i in range(1, len(rows)):
-        if rows[i]["generation"] <= rows[i - 1]["generation"]:
-            runs.append(rows[start:i])
-            start = i
-    runs.append(rows[start:])
-    return runs
+def job_id(csv_path: str) -> str:
+    base = os.path.splitext(os.path.basename(csv_path))[0]
+    return base.replace("generation_log", "").lstrip("_") or "run"
 
 
-def col(rows: list[dict], key: str) -> list[float]:
-    return [r[key] for r in rows]
+def latest_csv() -> str | None:
+    files = glob.glob("logs/generation_log*.csv") + glob.glob("generation_log*.csv")
+    return max(files, key=os.path.getmtime) if files else None
 
 
-def plot_run(run: list[dict], out_path: str, title_suffix: str = ""):
-    gen = col(run, "generation")
-    fitness_mean = col(run, "fitness_mean")
-    fitness_std = col(run, "fitness_std")
-    fitness_best = col(run, "fitness_best")
-    genome_var = col(run, "genome_variance_mean")
-    sigma = col(run, "cma_sigma")
+def has(d, *keys):
+    return all(k in d and len(d[k]) > 0 for k in keys)
 
-    lower = [m - s for m, s in zip(fitness_mean, fitness_std)]
-    upper = [m + s for m, s in zip(fitness_mean, fitness_std)]
 
-    fig, axes = plt.subplots(4, 1, figsize=(9, 13), sharex=True)
+def missing(ax, title):
+    ax.set_title(title)
+    ax.text(0.5, 0.5, "not logged in this run", ha="center", va="center",
+            transform=ax.transAxes, color=INK, fontsize=9)
+    ax.set_xticks([]); ax.set_yticks([])
 
-    # --- Panel 1: fitness (best + mean +/- std) ---
-    ax = axes[0]
-    ax.plot(gen, fitness_best, color=COLOR_BEST, linewidth=1.8, label="best fitness")
-    ax.plot(gen, fitness_mean, color=COLOR_MEAN, linewidth=1.8, label="mean fitness")
-    ax.fill_between(gen, lower, upper, color=COLOR_STD_BAND, alpha=0.2, label="mean +/- 1 std")
-    ax.set_ylabel("fitness")
+
+def style(ax, title, ylabel):
+    ax.set_title(title, loc="left")
+    ax.set_ylabel(ylabel)
     ax.set_xlabel("generation")
-    ax.set_title(f"Fitness per generation{title_suffix}")
-    ax.legend(loc="lower right", frameon=False)
-    ax.grid(alpha=0.3)
+    ax.grid(color=GRID, linewidth=0.6)
 
-    # --- Panel 2: fitness standard deviation (explicitly requested by Fuda) ---
-    ax = axes[1]
-    ax.plot(gen, fitness_std, color=COLOR_STD_LINE, linewidth=1.8)
-    ax.set_ylabel("fitness std dev")
-    ax.set_xlabel("generation")
-    ax.set_title("Standard deviation of fitness across the population")
-    ax.grid(alpha=0.3)
 
-    # --- Panel 3: mean genotype variance (explicitly requested by Fuda) ---
-    ax = axes[2]
-    ax.plot(gen, genome_var, color=COLOR_VARIANCE, linewidth=1.8)
-    ax.set_ylabel("mean genotype variance")
-    ax.set_xlabel("generation")
-    ax.set_title("Population genotype variance per generation")
-    ax.grid(alpha=0.3)
+# ---------------------------------------------------------------- single run
+def plot_single(d, run, out_path, episode_steps):
+    g = d["generation"]
+    fig, axes = plt.subplots(4, 2, figsize=(12, 14))
+    fig.suptitle(f"Hebbian / CMA-ES training, job {run}", fontsize=12, x=0.02, ha="left")
+    a = axes.ravel()
 
-    # --- Panel 4 (bonus): CMA-ES sigma ---
-    ax = axes[3]
-    ax.plot(gen, sigma, color=COLOR_SIGMA, linewidth=1.8)
-    ax.set_ylabel("CMA-ES sigma")
-    ax.set_xlabel("generation")
-    ax.set_title("CMA-ES step size (sigma) -- for context alongside genotype variance")
-    ax.grid(alpha=0.3)
+    # 1. fitness
+    ax = a[0]
+    if has(d, "fitness_mean", "fitness_best"):
+        m, s = d["fitness_mean"], d.get("fitness_std", [0] * len(g))
+        ax.fill_between(g, [x - y for x, y in zip(m, s)], [x + y for x, y in zip(m, s)],
+                        color=C1, alpha=0.15, linewidth=0, label="mean ± 1 std")
+        ax.plot(g, m, color=C1, lw=2, label="mean")
+        ax.plot(g, d["fitness_best"], color=C2, lw=2, label="best genome")
+        style(ax, "Fitness (per drone, max 100)", "fitness")
+        ax.legend(loc="upper left")
+    else:
+        missing(ax, "Fitness")
 
-    fig.tight_layout()
+    # 2. steps survived
+    ax = a[1]
+    if has(d, "steps_survived_mean"):
+        ax.plot(g, d["steps_survived_mean"], color=C1, lw=2, label="mean over genomes")
+        if has(d, "steps_survived_best"):
+            ax.plot(g, d["steps_survived_best"], color=C2, lw=2, label="best genome")
+        ax.axhline(episode_steps, color=INK, lw=1, ls="--")
+        ax.text(g[0], episode_steps, " full episode", va="bottom", fontsize=8, color=INK)
+        ax.set_ylim(0, episode_steps * 1.08)
+        style(ax, "Steps survived until first crash (avg of reps)", "steps (100 = 1 s)")
+        ax.legend(loc="lower right")
+    else:
+        missing(ax, "Steps survived")
+
+    # 3. full episodes
+    ax = a[2]
+    if has(d, "frac_full_episode"):
+        ax.plot(g, [100 * x for x in d["frac_full_episode"]], color=C3, lw=2)
+        ax.set_ylim(bottom=0)
+        style(ax, "Evaluations that never crashed", "% of all swarms")
+    else:
+        missing(ax, "Evaluations that never crashed")
+
+    # 4. saturation
+    ax = a[3]
+    if has(d, "sat_frac"):
+        ax.plot(g, [100 * x for x in d["sat_frac"]], color=C8, lw=2)
+        ax.set_ylim(bottom=0)
+        style(ax, "Commands at the action limits (>95%)", "% of actions")
+    else:
+        missing(ax, "Commands at the action limits")
+
+    # 5. weight size
+    ax = a[4]
+    if has(d, "w_abs_end"):
+        if has(d, "w_abs_start"):
+            ax.plot(g, d["w_abs_start"], color=C7, lw=2, label="before episode (evolved start)")
+        ax.plot(g, d["w_abs_end"], color=C4, lw=2, label="end of episode (after plasticity)")
+        style(ax, "Mean |weight|, layer 1", "mean |w|")
+        ax.legend(loc="upper left")
+    else:
+        missing(ax, "Mean |weight|")
+
+    # 6. sigma
+    ax = a[5]
+    if has(d, "cma_sigma"):
+        ax.plot(g, d["cma_sigma"], color=C5, lw=2)
+        style(ax, "CMA-ES step size (sigma)", "sigma")
+    else:
+        missing(ax, "CMA-ES sigma")
+
+    # 7. genome variance
+    ax = a[6]
+    if has(d, "genome_variance_mean"):
+        ax.plot(g, d["genome_variance_mean"], color=C6, lw=2)
+        style(ax, "Population genome variance (mean over parameters)", "variance")
+    else:
+        missing(ax, "Genome variance")
+
+    # 8. time per generation
+    ax = a[7]
+    if has(d, "seconds"):
+        ax.plot(g, d["seconds"], color=INK, lw=1.5)
+        ax.set_ylim(bottom=0)
+        style(ax, "Wall-clock time per generation", "seconds")
+    else:
+        missing(ax, "Time per generation")
+
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
 
-def mean(xs):
-    return sum(xs) / len(xs)
+# ---------------------------------------------------------------- comparison
+COMPARE_PANELS = [
+    ("steps_survived_mean", "Steps survived until first crash (mean over genomes)", "steps", 1),
+    ("steps_survived_best", "Steps survived until first crash (best genome)", "steps", 1),
+    ("fitness_best", "Best fitness (per drone, max 100)", "fitness", 1),
+    ("frac_full_episode", "Evaluations that never crashed", "% of all swarms", 100),
+]
 
 
-def find_latest_csv() -> str | None:
-    """Auto-detect the most recently written generation_log*.csv.
-
-    Looks in both ./logs (if you run this from the project root, next to
-    the logs/ folder) and the current directory (if you run this from
-    inside logs/ itself) -- covers either place you might put the script.
-    Matches both the new per-run naming (generation_log_<jobid>.csv) and
-    the old single-file naming (generation_log.csv).
-    """
-    candidates = []
-    for pattern in ("logs/generation_log*.csv", "generation_log*.csv"):
-        candidates.extend(glob.glob(pattern))
-    candidates = list(set(candidates))
-    if not candidates:
-        return None
-    return max(candidates, key=os.path.getmtime)
-
-
-def timestamped(path: str) -> str:
-    """Insert a YYYYMMDD_HHMMSS timestamp before the extension, so repeated
-    runs of this script never overwrite a previous plot. Used as a fallback
-    for old-style generation_log.csv files that have no job id in their name."""
-    base, ext = (path.rsplit(".", 1) + ["png"])[:2]
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{base}_{ts}.{ext}"
+def plot_compare(runs, labels, out_path, episode_steps):
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle("Run comparison", fontsize=12, x=0.02, ha="left")
+    for ax, (key, title, ylabel, factor) in zip(axes.ravel(), COMPARE_PANELS):
+        drawn = False
+        for i, (d, label) in enumerate(zip(runs, labels)):
+            if has(d, key):
+                ax.plot(d["generation"], [factor * x for x in d[key]],
+                        color=SERIES[i % len(SERIES)], lw=2, label=label)
+                drawn = True
+        if not drawn:
+            missing(ax, title)
+            continue
+        if key.startswith("steps_survived"):
+            ax.axhline(episode_steps, color=INK, lw=1, ls="--")
+            ax.set_ylim(0, episode_steps * 1.08)
+        style(ax, title, ylabel)
+        ax.legend(loc="best")
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
-def derive_out_name(csv_path: str, out_template: str) -> str:
-    """Name the plot after the CSV it came from, not after when you happened
-    to run this script -- e.g. logs/generation_log_3212345.csv with
-    --out training_progress.png becomes training_progress_3212345.png. This
-    way the filename itself tells you which job the plot belongs to."""
-    csv_base = os.path.splitext(os.path.basename(csv_path))[0]  # "generation_log_3212345"
-    suffix = csv_base
-    if suffix.startswith("generation_log"):
-        suffix = suffix[len("generation_log"):].lstrip("_")  # "3212345", or "" for old-style file
-    base, ext = (out_template.rsplit(".", 1) + ["png"])[:2]
-    if suffix:
-        return f"{base}_{suffix}.{ext}"
-    # Old-style generation_log.csv has no job id to borrow -- fall back to a timestamp
-    # so we still don't silently overwrite a previous plot.
-    return timestamped(out_template)
+# ---------------------------------------------------------------- summary
+def summary(d, run):
+    def first_last(k, fmt="{:.2f}"):
+        if not has(d, k):
+            return "not logged"
+        return f"{fmt.format(d[k][0])} -> {fmt.format(d[k][-1])}"
+
+    n = len(d.get("generation", []))
+    print(f"\n--- summary, job {run} ---")
+    print(f"generations           : {n}")
+    print(f"fitness mean          : {first_last('fitness_mean')}")
+    if has(d, "fitness_best"):
+        print(f"fitness best (max)    : {max(d['fitness_best']):.2f}")
+    print(f"steps survived mean   : {first_last('steps_survived_mean', '{:.0f}')}")
+    if has(d, "steps_survived_best"):
+        print(f"steps survived best   : {max(d['steps_survived_best']):.0f} (max over run)")
+    if has(d, "frac_full_episode"):
+        print(f"never crashed         : {100 * d['frac_full_episode'][-1]:.1f}% (last gen), "
+              f"{100 * max(d['frac_full_episode']):.1f}% (max)")
+    if has(d, "sat_frac"):
+        print(f"saturated actions     : {100 * d['sat_frac'][0]:.1f}% -> {100 * d['sat_frac'][-1]:.1f}%")
+    print(f"mean |w| end          : {first_last('w_abs_end', '{:.3f}')}")
+    print(f"sigma                 : {first_last('cma_sigma', '{:.4f}')}")
+    if has(d, "seconds"):
+        print(f"seconds/gen           : {d['seconds'][0]:.0f} -> {d['seconds'][-1]:.0f} "
+              f"(mean {sum(d['seconds']) / n:.0f})")
 
 
+# ---------------------------------------------------------------- main
 def main():
-    parser = argparse.ArgumentParser(description="Plot Hebbian/CMA-ES training progress")
-    parser.add_argument("--csv", type=str, default=None,
-                         help="Path to a specific generation_log*.csv. If omitted, auto-detects the "
-                              "most recently modified generation_log*.csv in ./logs or the current "
-                              "directory (i.e. your latest run) -- this is the normal way to use it.")
-    parser.add_argument("--out", type=str, default="training_progress.png",
-                         help="Output image path (default: training_progress.png). The CSV's job id is "
-                              "always inserted before the extension (e.g. training_progress_3212345.png) "
-                              "so the filename tells you which run it's from and previous plots are never "
-                              "overwritten; with --all-runs, the run number is added too.")
-    parser.add_argument("--all-runs", action="store_true",
-                         help="Plot every run found in the log separately, not just the latest one.")
-    parser.add_argument("--overwrite", action="store_true",
-                         help="Disable the job-id/timestamp naming and write exactly to --out, "
-                              "overwriting it if it exists.")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description="Plot Hebbian/CMA-ES training logs")
+    p.add_argument("--csv", help="one generation_log_<jobid>.csv (default: the newest in logs/)")
+    p.add_argument("--compare", nargs="+", help="several CSVs to overlay")
+    p.add_argument("--labels", nargs="+", help="legend labels for --compare (default: job ids)")
+    p.add_argument("--episode_steps", type=int, default=2000, help="max episode length (for the dashed line)")
+    p.add_argument("--out", help="output PNG path (default: named after the job id)")
+    args = p.parse_args()
 
-    csv_path = args.csv or find_latest_csv()
-    if csv_path is None:
-        parser.error("No generation_log*.csv found in ./logs or the current directory. "
-                      "Pass --csv path/to/generation_log_<jobid>.csv explicitly.")
-    if args.csv is None:
-        print(f"[INFO] No --csv given -- auto-detected latest: {csv_path}")
+    if args.compare:
+        runs = [load(c) for c in args.compare]
+        ids = [job_id(c) for c in args.compare]
+        labels = args.labels if args.labels and len(args.labels) == len(ids) else ids
+        out = args.out or f"comparison_{'_'.join(ids)}.png"
+        plot_compare(runs, labels, out, args.episode_steps)
+        for d, i in zip(runs, ids):
+            summary(d, i)
+        print(f"\n[INFO] Saved {out}")
+        return
 
-    rows = load_rows(csv_path)
-    runs = split_into_runs(rows)
-
-    if len(runs) > 1:
-        print(f"[INFO] Detected {len(runs)} separate runs in {csv_path} "
-              f"(generation numbers reset {len(runs) - 1} time(s), most likely from resubmitted jobs).")
-        for i, run in enumerate(runs):
-            print(f"        run {i}: {len(run)} generations, "
-                  f"avg {mean(col(run, 'seconds')):.1f}s/gen, "
-                  f"fitness_mean {run[0]['fitness_mean']:.2f} -> {run[-1]['fitness_mean']:.2f}")
-
-    out = args.out if args.overwrite else derive_out_name(csv_path, args.out)
-
-    if args.all_runs:
-        base, ext = out.rsplit(".", 1) if "." in out else (out, "png")
-        for i, run in enumerate(runs):
-            out_path = f"{base}_run{i}.{ext}"
-            plot_run(run, out_path, title_suffix=f" (run {i})")
-            print(f"[INFO] Saved {out_path}")
-    else:
-        latest = runs[-1]
-        if len(runs) > 1:
-            print(f"[INFO] Plotting only the latest run (run {len(runs) - 1}). "
-                  f"Pass --all-runs to plot every run.")
-        plot_run(latest, out)
-        print(f"[INFO] Saved {out}")
-
-        # Quick numeric summary, handy for a status update / email.
-        print("\n--- summary (latest run) ---")
-        print(f"generations: {len(latest)}")
-        print(f"fitness_mean: {latest[0]['fitness_mean']:.2f} -> {latest[-1]['fitness_mean']:.2f}")
-        print(f"fitness_best (max over run): {max(col(latest, 'fitness_best')):.2f}")
-        print(f"genome_variance_mean: {latest[0]['genome_variance_mean']:.3f} -> "
-              f"{latest[-1]['genome_variance_mean']:.3f}")
-        print(f"cma_sigma: {latest[0]['cma_sigma']:.3f} -> {latest[-1]['cma_sigma']:.3f}")
-        print(f"seconds/gen (mean): {mean(col(latest, 'seconds')):.1f}")
+    path = args.csv or latest_csv()
+    if path is None:
+        p.error("No generation_log*.csv found in ./logs. Pass --csv explicitly.")
+    if not args.csv:
+        print(f"[INFO] Using newest log: {path}")
+    d = load(path)
+    run = job_id(path)
+    out = args.out or f"training_progress_{run}.png"
+    plot_single(d, run, out, args.episode_steps)
+    summary(d, run)
+    print(f"\n[INFO] Saved {out}")
 
 
 if __name__ == "__main__":

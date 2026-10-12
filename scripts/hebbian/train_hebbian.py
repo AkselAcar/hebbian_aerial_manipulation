@@ -20,7 +20,7 @@ Changes compared with version 1 (the first commit on this branch):
    scale used by skrl / Jack / Fuda (= 3 x the per-drone fitness).
 
 Fitness scales: per drone, the maximum for a perfect 2000-step episode is
-100 (5 reward terms weight sum 5 x step_dt 0.01 x 2000 steps). Summed over
+100 (6 reward terms, weights summing to 5 x step_dt 0.01 x 2000 steps). Summed over
 the 3 drones the maximum is 300.
 """
 
@@ -37,6 +37,10 @@ parser.add_argument("--pop_size", type=int, default=2, help="CMA-ES population s
 parser.add_argument("--n_reps", type=int, default=3, help="Evaluations per genome (run in parallel)")
 parser.add_argument("--n_generations", type=int, default=1)
 parser.add_argument("--episode_steps", type=int, default=50, help="Max steps per episode")
+parser.add_argument("--genome", choices=["w_abcd", "w"], default="w_abcd",
+                    help="w_abcd: evolve start weights + ABCD | w: static baseline (weights only)")
+parser.add_argument("--sigma0", type=float, default=0.1, help="CMA-ES initial step size (paper: 1.0)")
+parser.add_argument("--lr", type=float, default=0.001, help="Hebbian learning rate (paper: 0.1)")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, _ = parser.parse_known_args()
 
@@ -83,15 +87,19 @@ def main():
 
     genotype = thymio_genotype("hNN", n_input, n_output)
     genotype["controller"]["params"]["n_hidden"] = n_hidden
-    n_synapses = n_hidden * n_input + n_hidden * n_hidden + n_output * n_hidden
-    D = 4 * n_synapses  # 4556 ABCD coefficients
-
-    os.makedirs("./results", exist_ok=True)
-    os.makedirs("./logs", exist_ok=True)
-    ea_params = {"bounds": (-5, 5), "D": D, "pop_size": pop, "sigma0": 1.0}
-    learner = CMAes(ea_params, output_dir="./results")
+    n_synapses = n_hidden * n_input + n_hidden * n_hidden + n_output * n_hidden  # 1139
+    D = 5 * n_synapses if args_cli.genome == "w_abcd" else n_synapses  # 5695 or 1139
+    x0 = np.zeros(D)  # outputs start at 0 = hold position
 
     run_id = os.environ.get("SLURM_JOB_ID", time.strftime("%Y%m%d_%H%M%S"))
+    results_dir = f"./results/{run_id}"
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs("./logs", exist_ok=True)
+    ea_params = {"bounds": (-5, 5), "D": D, "pop_size": pop,
+                 "sigma0": args_cli.sigma0, "x0": x0}
+    learner = CMAes(ea_params, output_dir=results_dir)
+    print(f"genome={args_cli.genome}, D={D}, sigma0={args_cli.sigma0}, "
+          f"lr={args_cli.lr}, results in {results_dir}", flush=True)
     log_path = f"./logs/generation_log_{run_id}.csv"
     log_fields = [
         "generation",
@@ -100,6 +108,8 @@ def main():
         "steps_survived_mean", "steps_survived_best",         # steps until first crash
         "frac_full_episode",                                  # evaluations that never crashed
         "stuck_at_start",                                     # envs terminating on step 0
+        "sat_frac",                                           # share of actions at the limits
+        "w_abs_end",                                          # mean |weight| at episode end
         "steps_simulated",                                    # episode length actually run
         "genome_variance_mean", "cma_sigma", "seconds",
     ]
@@ -117,9 +127,12 @@ def main():
         controllers = {agent: [] for agent in agents}
         for j in range(n_envs):
             genome = learner.x_new[j % pop]
+            if args_cli.genome == "w":  # static baseline: zero rules, no plasticity
+                genome = np.concatenate([genome, np.zeros(4 * n_synapses)])
             for agent in agents:
                 ind = Individual(genotype, 0)
                 ind.geno2pheno(genome)
+                ind.controller.lr = args_cli.lr
                 controllers[agent].append(ind.controller)
 
         obs, _ = env.reset()
@@ -128,6 +141,8 @@ def main():
         steps_survived = np.full(n_envs, args_cli.episode_steps)
         stuck_at_start = 0
         steps_simulated = 0
+        scale = controllers[agents[0]][0].action_scale  # [5, 5, 5, 2, 2]
+        sat_count, act_count = 0, 0
 
         for t in range(args_cli.episode_steps):
             alive_idx = np.where(alive)[0]
@@ -139,6 +154,9 @@ def main():
                 # get zero actions (their reward is ignored anyway).
                 for j in alive_idx:
                     acts[j] = controllers[agent][j].velocity_commands(obs_agent[j])
+                a = acts[alive_idx]
+                sat_count += int((np.abs(a) > 0.95 * scale).sum())
+                act_count += a.size
                 actions[agent] = torch.tensor(acts, dtype=torch.float32, device=device)
 
             obs, rewards, terminated, truncated, info = env.step(actions)
@@ -158,6 +176,9 @@ def main():
             alive &= ~(crashed | timed_out) # Once an env has terminated, it is no longer alive and its reward is ignored.
             if not alive.any():
                 break  # every env has terminated once: nothing left to measure
+
+        sat_frac = sat_count / max(act_count, 1)
+        w_abs_end = float(np.mean([np.abs(c.weights_l1).mean() for c in controllers[agents[0]]]))
 
         # --- average the reps of each genome --------------------------------
         # Env j = rep * pop + i, so reshaping to (n_reps, pop) puts rep in the
@@ -191,6 +212,8 @@ def main():
             "steps_survived_best": float(np.max(survived)),
             "frac_full_episode": frac_full,
             "stuck_at_start": stuck_at_start,
+            "sat_frac": sat_frac,
+            "w_abs_end": w_abs_end,
             "steps_simulated": steps_simulated,
             "genome_variance_mean": genome_variance_mean,
             "cma_sigma": cma_sigma,
@@ -202,6 +225,7 @@ def main():
               f"(x3: {n_agents * fitness_best:.1f}) | survived mean {np.mean(survived):.0f} "
               f"best {np.max(survived):.0f} steps | full episodes {frac_full:.1%} | "
               f"stuck_at_start {stuck_at_start} | sim steps {steps_simulated} | "
+              f"sat {sat_frac:.1%} | |w| {w_abs_end:.3f} | "
               f"sigma {cma_sigma:.3f} | {gen_time_s:.1f}s", flush=True)
 
     log_file.close()
