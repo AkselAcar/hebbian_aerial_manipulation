@@ -99,7 +99,7 @@ def style(ax, title, ylabel):
 # ---------------------------------------------------------------- single run
 def plot_single(d, run, out_path, episode_steps):
     g = d["generation"]
-    fig, axes = plt.subplots(4, 2, figsize=(12, 14))
+    fig, axes = plt.subplots(5, 2, figsize=(12, 17.5))
     fig.suptitle(f"Hebbian / CMA-ES training, job {run}", fontsize=12, x=0.02, ha="left")
     a = axes.ravel()
 
@@ -184,7 +184,32 @@ def plot_single(d, run, out_path, episode_steps):
     else:
         missing(ax, "Time per generation")
 
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    # 9. command size
+    ax = a[8]
+    if has(d, "act_acc_frac", "act_rate_frac"):
+        ax.plot(g, [100 * x for x in d["act_acc_frac"]], color=C1, lw=2, label="linear acceleration (limit 5 m/s²)")
+        ax.plot(g, [100 * x for x in d["act_rate_frac"]], color=C2, lw=2, label="body rate (limit 2 rad/s)")
+        ax.set_ylim(bottom=0)
+        style(ax, "Mean command size", "% of the limit")
+        ax.legend(loc="upper left")
+    else:
+        missing(ax, "Mean command size")
+
+    # 10. first-crash reasons
+    ax = a[9]
+    reasons = [k for k in d if k.startswith("crash_")]
+    if reasons:
+        for i, k in enumerate(reasons):
+            vals = [100 * x for x in d[k]]
+            if max(vals) > 0:  # only conditions that ever ended a swarm
+                ax.plot(g, vals, color=SERIES[i % len(SERIES)], lw=1.8, label=k[len("crash_"):])
+        ax.set_ylim(0, 105)
+        style(ax, "What ended each swarm's first crash", "% of crashed swarms")
+        ax.legend(loc="upper left", ncol=2)
+    else:
+        missing(ax, "First-crash reasons")
+
+    fig.tight_layout(rect=(0, 0, 1, 0.975))
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
@@ -242,7 +267,16 @@ def summary(d, run):
               f"{100 * max(d['frac_full_episode']):.1f}% (max)")
     if has(d, "sat_frac"):
         print(f"saturated actions     : {100 * d['sat_frac'][0]:.1f}% -> {100 * d['sat_frac'][-1]:.1f}%")
+    print(f"mean |w| start        : {first_last('w_abs_start', '{:.3f}')}")
     print(f"mean |w| end          : {first_last('w_abs_end', '{:.3f}')}")
+    if has(d, "act_acc_frac", "act_rate_frac"):
+        print(f"command size (% limit): acc {100 * d['act_acc_frac'][-1]:.1f}%, "
+              f"rate {100 * d['act_rate_frac'][-1]:.1f}% (last gen)")
+    reasons = {k[len("crash_"):]: d[k][-1] for k in d if k.startswith("crash_") and d[k]}
+    if reasons:
+        top = sorted(reasons.items(), key=lambda kv: -kv[1])[:3]
+        print("first-crash reasons   : " + ", ".join(f"{k} {100 * v:.0f}%" for k, v in top if v > 0)
+              + " (last gen)")
     print(f"sigma                 : {first_last('cma_sigma', '{:.4f}')}")
     if has(d, "seconds"):
         print(f"seconds/gen           : {d['seconds'][0]:.0f} -> {d['seconds'][-1]:.0f} "

@@ -14,10 +14,15 @@ Changes compared with version 1 (the first commit on this branch):
    initialized brains, so the reps stay independent. The episode also
    stops early as soon as every env has terminated once.
 
-3. LOGGING: the CSV now also contains steps survived (= how long swarms
+3. LOGGING (v3 additions, see the end of this list): the CSV now also contains steps survived (= how long swarms
    fly before their first crash), the fraction of evaluations that
    survived the full episode, and fitness on the "summed over 3 drones"
    scale used by skrl / Jack / Fuda (= 3 x the per-drone fitness).
+
+v3 diagnostics: weight size before and after each episode (w_abs_start /
+w_abs_end), mean command size as a fraction of the limits (act_acc_frac /
+act_rate_frac), and for every swarm the termination condition(s) that ended
+its FIRST crash (crash_<condition> columns = share of crashed swarms).
 
 Fitness scales: per drone, the maximum for a perfect 2000-step episode is
 100 (6 reward terms, weights summing to 5 x step_dt 0.01 x 2000 steps). Summed over
@@ -100,6 +105,20 @@ def main():
     learner = CMAes(ea_params, output_dir=results_dir)
     print(f"genome={args_cli.genome}, D={D}, sigma0={args_cli.sigma0}, "
           f"lr={args_cli.lr}, results in {results_dir}", flush=True)
+    # The 8 termination conditions of the hover env (see _get_dones in
+    # marl_hover_env.py). Each is a True/False tensor per env, recomputed on
+    # every env.step(); several can be True at once.
+    CRASH_REASONS = [
+        "falcon_fly_low",     # a drone below 10 cm
+        "payload_fly_low",    # payload below 10 cm
+        "illegal_contact",    # contact force above threshold
+        "angle_limit_drone",  # cable too steep relative to its drone
+        "angle_limit_load",   # cable too steep relative to the payload
+        "cable_collision",    # cables too close to each other
+        "drone_collision",    # drones too close to each other
+        "body_pos_outside",   # a drone outside the bounding box
+    ]
+
     log_path = f"./logs/generation_log_{run_id}.csv"
     log_fields = [
         "generation",
@@ -109,10 +128,12 @@ def main():
         "frac_full_episode",                                  # evaluations that never crashed
         "stuck_at_start",                                     # envs terminating on step 0
         "sat_frac",                                           # share of actions at the limits
+        "w_abs_start",                                        # mean |weight| before the episode
         "w_abs_end",                                          # mean |weight| at episode end
+        "act_acc_frac", "act_rate_frac",                      # mean |command| / limit
         "steps_simulated",                                    # episode length actually run
         "genome_variance_mean", "cma_sigma", "seconds",
-    ]
+    ] + [f"crash_{name}" for name in CRASH_REASONS]           # share of crashed swarms
     log_file = open(log_path, "w", newline="")
     log_writer = csv.DictWriter(log_file, fieldnames=log_fields)
     log_writer.writeheader()
@@ -122,8 +143,8 @@ def main():
 
         # --- one fresh brain per environment and drone ----------------------
         # Environment j runs genome j % pop. The three envs that share a genome
-        # (j, j + pop, j + 2*pop) each get their own Individual, so their
-        # random starting weights and Hebbian updates are independent.
+        # (j, j + pop, j + 2*pop) each get their own Individual: they start from
+        # the same evolved weights, but their Hebbian updates are independent.
         controllers = {agent: [] for agent in agents}
         for j in range(n_envs):
             genome = learner.x_new[j % pop]
@@ -135,6 +156,9 @@ def main():
                 ind.controller.lr = args_cli.lr
                 controllers[agent].append(ind.controller)
 
+        # weight size before the episode = the evolved starting weights
+        w_abs_start = float(np.mean([np.abs(c.weights_l1).mean() for c in controllers[agents[0]]]))
+
         obs, _ = env.reset()
         fitness_env = np.zeros(n_envs)                         # reward until first termination
         alive = np.ones(n_envs, dtype=bool)                    # False after first termination
@@ -143,6 +167,10 @@ def main():
         steps_simulated = 0
         scale = controllers[agents[0]][0].action_scale  # [5, 5, 5, 2, 2]
         sat_count, act_count = 0, 0
+        act_abs_sum = np.zeros(n_output)   # sum of |command| / limit, per action component
+        act_rows = 0                       # number of (env, drone, step) commands summed
+        crash_counts = {name: 0 for name in CRASH_REASONS}
+        n_crashed = 0
 
         for t in range(args_cli.episode_steps):
             alive_idx = np.where(alive)[0]
@@ -157,6 +185,8 @@ def main():
                 a = acts[alive_idx]
                 sat_count += int((np.abs(a) > 0.95 * scale).sum())
                 act_count += a.size
+                act_abs_sum += (np.abs(a) / scale).sum(axis=0)
+                act_rows += a.shape[0]
                 actions[agent] = torch.tensor(acts, dtype=torch.float32, device=device)
 
             obs, rewards, terminated, truncated, info = env.step(actions)
@@ -170,6 +200,16 @@ def main():
 
             new_crash = crashed & alive
             steps_survived[new_crash] = t + 1
+
+            # Why did these swarms crash? The env's termination flags still hold
+            # the values computed during this step, before the auto-reset.
+            if new_crash.any():
+                n_crashed += int(new_crash.sum())
+                for name in CRASH_REASONS:
+                    flag = getattr(u, name, None)
+                    if flag is not None:
+                        flag = flag.cpu().numpy().astype(bool).reshape(-1)
+                        crash_counts[name] += int((flag & new_crash).sum())
             if t == 0:
                 stuck_at_start = int(new_crash.sum())
 
@@ -179,6 +219,10 @@ def main():
 
         sat_frac = sat_count / max(act_count, 1)
         w_abs_end = float(np.mean([np.abs(c.weights_l1).mean() for c in controllers[agents[0]]]))
+        act_frac = act_abs_sum / max(act_rows, 1)          # per component, 0 = nothing, 1 = at the limit
+        act_acc_frac = float(act_frac[:3].mean())          # 3 linear accelerations
+        act_rate_frac = float(act_frac[3:].mean())         # 2 body rates
+        crash_frac = {name: crash_counts[name] / max(n_crashed, 1) for name in CRASH_REASONS}
 
         # --- average the reps of each genome --------------------------------
         # Env j = rep * pop + i, so reshaping to (n_reps, pop) puts rep in the
@@ -213,11 +257,15 @@ def main():
             "frac_full_episode": frac_full,
             "stuck_at_start": stuck_at_start,
             "sat_frac": sat_frac,
+            "w_abs_start": w_abs_start,
             "w_abs_end": w_abs_end,
+            "act_acc_frac": act_acc_frac,
+            "act_rate_frac": act_rate_frac,
             "steps_simulated": steps_simulated,
             "genome_variance_mean": genome_variance_mean,
             "cma_sigma": cma_sigma,
             "seconds": gen_time_s,
+            **{f"crash_{name}": crash_frac[name] for name in CRASH_REASONS},
         })
         log_file.flush()
 
@@ -225,8 +273,12 @@ def main():
               f"(x3: {n_agents * fitness_best:.1f}) | survived mean {np.mean(survived):.0f} "
               f"best {np.max(survived):.0f} steps | full episodes {frac_full:.1%} | "
               f"stuck_at_start {stuck_at_start} | sim steps {steps_simulated} | "
-              f"sat {sat_frac:.1%} | |w| {w_abs_end:.3f} | "
+              f"sat {sat_frac:.1%} | |w| {w_abs_start:.3f}->{w_abs_end:.3f} | "
+              f"cmd acc {act_acc_frac:.1%} rate {act_rate_frac:.1%} of limit | "
               f"sigma {cma_sigma:.3f} | {gen_time_s:.1f}s", flush=True)
+        top = sorted(crash_frac.items(), key=lambda kv: -kv[1])[:3]
+        print("    first-crash reasons: " + ", ".join(f"{k} {v:.0%}" for k, v in top if v > 0),
+              flush=True)
 
     log_file.close()
     env.close()
