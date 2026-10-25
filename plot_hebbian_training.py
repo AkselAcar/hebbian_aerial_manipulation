@@ -96,11 +96,27 @@ def style(ax, title, ylabel):
     ax.grid(color=GRID, linewidth=0.6)
 
 
+# ---------------------------------------------------------------- optimizer
+OPT_NAMES = {"cmaes": "CMA-ES", "openai_es": "OpenAI-ES"}
+
+
+def detect_optimizer(d, override="auto"):
+    """Which optimizer wrote this log? The CSV has no text column for it, so:
+    OpenAI-ES logs a non-zero es_step_norm (size of the centre update) every
+    generation, CMA-ES logs 0 there (or the column is missing in old logs)."""
+    if override != "auto":
+        return override
+    if has(d, "es_step_norm") and max(d["es_step_norm"]) > 0:
+        return "openai_es"
+    return "cmaes"
+
+
 # ---------------------------------------------------------------- single run
-def plot_single(d, run, out_path, episode_steps):
+def plot_single(d, run, out_path, episode_steps, optimizer="cmaes"):
     g = d["generation"]
+    opt = OPT_NAMES[optimizer]
     fig, axes = plt.subplots(5, 2, figsize=(12, 17.5))
-    fig.suptitle(f"Hebbian / CMA-ES training, job {run}", fontsize=12, x=0.02, ha="left")
+    fig.suptitle(f"Hebbian / {opt} training, job {run}", fontsize=12, x=0.02, ha="left")
     a = axes.ravel()
 
     # 1. fitness
@@ -159,17 +175,23 @@ def plot_single(d, run, out_path, episode_steps):
     else:
         missing(ax, "Mean |weight|")
 
-    # 6. sigma
+    # 6. sigma (column is called cma_sigma for both optimizers)
     ax = a[5]
+    sigma_title = ("CMA-ES step size σ (adapts by itself)" if optimizer == "cmaes"
+                   else "OpenAI-ES noise σ (fixed, set by --sigma0)")
     if has(d, "cma_sigma"):
         ax.plot(g, d["cma_sigma"], color=C5, lw=2)
-        style(ax, "CMA-ES step size (sigma)", "sigma")
+        style(ax, sigma_title, "σ")
     else:
-        missing(ax, "CMA-ES sigma")
+        missing(ax, sigma_title)
 
-    # 7. genome variance
+    # 7. CMA-ES: how spread out the population is; OpenAI-ES: how far the centre moves
     ax = a[6]
-    if has(d, "genome_variance_mean"):
+    if optimizer == "openai_es" and has(d, "es_step_norm"):
+        ax.plot(g, d["es_step_norm"], color=C6, lw=1.5)
+        ax.set_ylim(bottom=0)
+        style(ax, "Size of the centre update per generation (‖Δθ‖)", "‖Δθ‖")
+    elif has(d, "genome_variance_mean"):
         ax.plot(g, d["genome_variance_mean"], color=C6, lw=2)
         style(ax, "Population genome variance (mean over parameters)", "variance")
     else:
@@ -247,14 +269,14 @@ def plot_compare(runs, labels, out_path, episode_steps):
 
 
 # ---------------------------------------------------------------- summary
-def summary(d, run):
+def summary(d, run, optimizer="cmaes"):
     def first_last(k, fmt="{:.2f}"):
         if not has(d, k):
             return "not logged"
         return f"{fmt.format(d[k][0])} -> {fmt.format(d[k][-1])}"
 
     n = len(d.get("generation", []))
-    print(f"\n--- summary, job {run} ---")
+    print(f"\n--- summary, job {run} ({OPT_NAMES[optimizer]}) ---")
     print(f"generations           : {n}")
     print(f"fitness mean          : {first_last('fitness_mean')}")
     if has(d, "fitness_best"):
@@ -285,12 +307,14 @@ def summary(d, run):
 
 # ---------------------------------------------------------------- main
 def main():
-    p = argparse.ArgumentParser(description="Plot Hebbian/CMA-ES training logs")
+    p = argparse.ArgumentParser(description="Plot Hebbian evolution-strategy training logs")
     p.add_argument("--csv", help="one generation_log_<jobid>.csv (default: the newest in logs/)")
     p.add_argument("--compare", nargs="+", help="several CSVs to overlay")
     p.add_argument("--labels", nargs="+", help="legend labels for --compare (default: job ids)")
     p.add_argument("--episode_steps", type=int, default=2000, help="max episode length (for the dashed line)")
     p.add_argument("--out", help="output PNG path (default: named after the job id)")
+    p.add_argument("--optimizer", choices=["auto", "cmaes", "openai_es"], default="auto",
+                   help="label the plots for this optimizer (default: detect it from the log)")
     args = p.parse_args()
 
     if args.compare:
@@ -300,7 +324,7 @@ def main():
         out = args.out or f"comparison_{'_'.join(ids)}.png"
         plot_compare(runs, labels, out, args.episode_steps)
         for d, i in zip(runs, ids):
-            summary(d, i)
+            summary(d, i, detect_optimizer(d, args.optimizer))
         print(f"\n[INFO] Saved {out}")
         return
 
@@ -312,8 +336,9 @@ def main():
     d = load(path)
     run = job_id(path)
     out = args.out or f"training_progress_{run}.png"
-    plot_single(d, run, out, args.episode_steps)
-    summary(d, run)
+    optimizer = detect_optimizer(d, args.optimizer)
+    plot_single(d, run, out, args.episode_steps, optimizer)
+    summary(d, run, optimizer)
     print(f"\n[INFO] Saved {out}")
 
 
