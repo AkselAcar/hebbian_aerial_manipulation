@@ -1,0 +1,16 @@
+quantity,value,unit
+flights,64,
+flights without crash (full 20 s),96.9,%
+"final position error, mean",0.552,m
+"final position error, median",0.477,m
+"final attitude error, mean",80.5,deg
+"final attitude error, median",70.2,deg
+ending within 0.3 m,14.5,%
+ending within 15 deg,0.0,%
+ending within 0.3 m AND 15 deg,0.0,%
+"final |error| x, mean",0.253,m
+"final |error| x, median",0.218,m
+"final |error| y, mean",0.335,m
+"final |error| y, median",0.244,m
+"final |error| z, mean",0.249,m
+"final |error| z, median",0.212,m

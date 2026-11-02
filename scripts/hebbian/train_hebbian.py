@@ -1,5 +1,11 @@
 """
-Hebbian / evolution-strategy training for the flycrane hover task (version 5).
+Hebbian / evolution-strategy training for the flycrane hover task (version 6).
+
+v6: --mass_range LO HI draws a new payload mass (kg, uniform) for every env at
+    every reset, i.e. every generation (default: fixed 1.4 kg as before).
+    --init_from <theta.npy> starts the search from a trained genome instead of
+    zeros (warm start). The payload masses of each generation are logged
+    (payload_mass_min / _mean / _max) so the randomization can be checked.
 
 v5: the controllers of all swarms run as ONE batched GPU computation
     (utils/batched_hebbian.py) instead of one numpy call per drone per env per
@@ -46,6 +52,10 @@ parser.add_argument("--es_optimizer", choices=["adam", "sgd"], default="adam",
                     help="OpenAI-ES only: adam (Salimans et al.) or sgd = plain gradient step (Najarro & Risi)")
 parser.add_argument("--weight_decay", type=float, default=0.005, help="OpenAI-ES only: L2 penalty on the genome")
 parser.add_argument("--lr", type=float, default=0.001, help="Hebbian learning rate (paper: 0.1)")
+parser.add_argument("--mass_range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="payload mass range in kg, new mass every reset (default: fixed 1.4 kg)")
+parser.add_argument("--init_from", type=str, default=None,
+                    help="start genome, e.g. results/<run>/theta.npy (default: zeros)")
 parser.add_argument("--tag", type=str, default="",
                     help="Optional label added to the log/results names, e.g. eslr0.001_s0.02")
 AppLauncher.add_app_launcher_args(parser)
@@ -82,6 +92,25 @@ CRASH_REASONS = [
 ]
 
 
+def payload_masses(u, body="load_link"):
+    """Payload mass of every env as the simulator currently sees it (None if not readable)."""
+    try:
+        idx = u.robot.find_bodies(body)[0][0]
+    except Exception:
+        return None
+    getters = (lambda: u.robot.root_physx_view.get_masses(),
+               lambda: u.robot.root_view.get_masses(),
+               lambda: u.robot.data.body_mass)
+    for get in getters:
+        try:
+            m = get()
+            m = torch.as_tensor(getattr(m, "torch", m))
+            return m.reshape(m.shape[0], -1)[:, idx].float().cpu()
+        except Exception:
+            continue
+    return None
+
+
 def flat(x):
     """Env outputs can be (n_envs,) or (n_envs, 1): make them (n_envs,)."""
     return x.reshape(-1)
@@ -98,6 +127,12 @@ def main():
     env_cfg = MARLHoverEnvCfg()
     env_cfg.scene.num_envs = n_envs
     env_cfg.history_len = 1
+    if args_cli.mass_range is not None:
+        # The env already has a mass event (fixed 1.4 kg, applied once at startup).
+        # Give it a range and run it at every reset instead.
+        mass_ev = env_cfg.events.randomize_mass
+        mass_ev.params["mass_distribution_params"] = tuple(args_cli.mass_range)
+        mass_ev.mode = "reset"
     env = gym.make(args_cli.task, cfg=env_cfg)
     u = env.unwrapped
 
@@ -113,6 +148,11 @@ def main():
     n_synapses = n_hidden * n_input + n_hidden * n_hidden + n_output * n_hidden  # 1139
     D = 5 * n_synapses if args_cli.genome == "w_abcd" else n_synapses             # 5695 or 1139
     x0 = np.zeros(D)  # outputs start at 0 = hold position
+    if args_cli.init_from:
+        x0 = np.load(args_cli.init_from).astype(float).reshape(-1)
+        if x0.size != D:
+            raise ValueError(f"--init_from has {x0.size} values, genome {args_cli.genome} needs {D}")
+        print(f"warm start from {args_cli.init_from} (mean |value| {np.abs(x0).mean():.4f})", flush=True)
 
     run_id = os.environ.get("SLURM_JOB_ID", time.strftime("%Y%m%d_%H%M%S"))
     if args_cli.tag:
@@ -132,6 +172,8 @@ def main():
           f"es_lr={args_cli.es_lr}, weight_decay={args_cli.weight_decay}")
     print(f"genome={args_cli.genome}, D={D}, sigma0={args_cli.sigma0}, "
           f"lr={args_cli.lr}, results in {results_dir}", flush=True)
+    print(f"payload mass: {'random ' + str(args_cli.mass_range) + ' kg, new every reset' if args_cli.mass_range else 'fixed (env default 1.4 kg)'}",
+          flush=True)
 
     brains = BatchedHebbian(n_input, n_hidden, n_output, lr=args_cli.lr, device=device)
     scale = brains.action_scale                                   # [5, 5, 5, 2, 2]
@@ -151,6 +193,7 @@ def main():
         "steps_simulated",                                    # episode length actually run
         "genome_variance_mean", "cma_sigma", "seconds",       # cma_sigma = sigma of either optimizer
         "es_step_norm",                                       # OpenAI-ES: size of the last update
+        "payload_mass_min", "payload_mass_mean", "payload_mass_max",  # kg, this generation
     ] + [f"crash_{name}" for name in CRASH_REASONS]           # share of crashed swarms
     log_file = open(log_path, "w", newline="")
     log_writer = csv.DictWriter(log_file, fieldnames=log_fields)
@@ -166,6 +209,8 @@ def main():
         w_abs_start = brains.mean_abs_w1(agent=0)
 
         obs, _ = env.reset()
+        pm = payload_masses(u)   # masses drawn by this reset
+        pm_stats = (float(pm.min()), float(pm.mean()), float(pm.max())) if pm is not None else (np.nan,) * 3
         fitness_env = torch.zeros(n_envs, device=device)               # reward until first termination
         alive = torch.ones(n_envs, dtype=torch.bool, device=device)    # False after first termination
         steps_survived = torch.full((n_envs,), T, dtype=torch.long, device=device)
@@ -268,6 +313,7 @@ def main():
             "cma_sigma": sigma,
             "seconds": gen_time_s,
             "es_step_norm": getattr(learner, "last_step_norm", 0.0),
+            "payload_mass_min": pm_stats[0], "payload_mass_mean": pm_stats[1], "payload_mass_max": pm_stats[2],
             **{f"crash_{name}": float(crash_frac[k]) for k, name in enumerate(CRASH_REASONS)},
         })
         log_file.flush()
@@ -278,7 +324,7 @@ def main():
               f"stuck_at_start {stuck_at_start} | sim steps {steps_simulated} | "
               f"sat {sat_frac:.1%} | |w| {w_abs_start:.3f}->{w_abs_end:.3f} | "
               f"cmd acc {act_acc_frac:.1%} rate {act_rate_frac:.1%} of limit | "
-              f"sigma {sigma:.3f} | {gen_time_s:.1f}s", flush=True)
+              f"sigma {sigma:.3f} | payload {pm_stats[0]:.2f}-{pm_stats[2]:.2f} kg | {gen_time_s:.1f}s", flush=True)
         top = sorted(zip(CRASH_REASONS, crash_frac), key=lambda kv: -kv[1])[:3]
         print("    first-crash reasons: " + ", ".join(f"{k} {v:.0%}" for k, v in top if v > 0),
               flush=True)
