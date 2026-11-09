@@ -31,6 +31,7 @@ Plot them with plot_replay.py.
 """
 
 import argparse
+import json
 import os
 import time
 
@@ -51,6 +52,13 @@ parser.add_argument("--episode_steps", type=int, default=2000)
 parser.add_argument("--lr", type=float, default=0.001, help="Hebbian learning rate (same as in training!)")
 parser.add_argument("--payload_mass", type=float, default=None,
                     help="payload mass in kg for the whole replay (default: env default 1.4 kg)")
+parser.add_argument("--hebb_decay", type=float, default=None,
+                    help="plasticity brake [1/s] (default: the value in <results_dir>/train_args.json, else 0)")
+parser.add_argument("--hebb_gate", type=float, default=None,
+                    help="plasticity gate [m] (default: the value in <results_dir>/train_args.json, else 0)")
+parser.add_argument("--freeze_after", type=float, default=-1,
+                    help="switch plasticity off after this many seconds of each flight (default: never)")
+parser.add_argument("--zero_id", action="store_true", help="set the one-hot drone ID inputs (12:15) to 0")
 parser.add_argument("--record_weights", action="store_true",
                     help="save the 3 networks of one swarm during each episode (weights_ep<k>.npz, for plot_network.py)")
 parser.add_argument("--record_env", type=int, default=0, help="with --record_weights: which swarm to record")
@@ -265,13 +273,28 @@ def main():
 
     u._get_dones = get_dones_with_snapshot
 
-    brains = BatchedHebbian(lr=args_cli.lr, device=device)
+    # plasticity brakes: same as in training unless given on the command line
+    targs = {}
+    tpath = os.path.join(args_cli.results_dir, "train_args.json")
+    if os.path.exists(tpath):
+        with open(tpath) as f:
+            targs = json.load(f)
+    hebb_decay = args_cli.hebb_decay if args_cli.hebb_decay is not None else float(targs.get("hebb_decay", 0.0))
+    hebb_gate = args_cli.hebb_gate if args_cli.hebb_gate is not None else float(targs.get("hebb_gate", 0.0))
+    if targs and abs(float(targs.get("lr", args_cli.lr)) - args_cli.lr) > 1e-12:
+        print(f"WARNING: trained with Hebbian lr {targs.get('lr')}, replaying with {args_cli.lr}", flush=True)
+    print(f"plasticity brakes: decay {hebb_decay}/s, gate {hebb_gate} m", flush=True)
+    brains = BatchedHebbian(lr=args_cli.lr, device=device, decay=hebb_decay * u.step_dt)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     label = args_cli.which if args_cli.which == "theta" or args_cli.best_gen == -1 else f"best_gen{args_cli.best_gen}"
     if args_cli.payload_mass is not None:
         label += f"_m{args_cli.payload_mass:g}"
     if args_cli.lr != 0.001:
         label += f"_heblr{args_cli.lr:g}"          # e.g. _heblr0 = plasticity switched off
+    if args_cli.freeze_after >= 0:
+        label += f"_freeze{args_cli.freeze_after:g}s"
+    if args_cli.zero_id:
+        label += "_noid"
     out_dir = os.path.join(args_cli.results_dir, f"replay_{label}_{stamp}")
     os.makedirs(out_dir, exist_ok=True)
     summary = [f"genome: {args_cli.which} from {args_cli.results_dir}, Hebbian lr {args_cli.lr}, payload {mass:.3f} kg",
@@ -280,7 +303,10 @@ def main():
 
     for ep in range(args_cli.n_episodes):
         brains.load(genome[None, :], n_envs, n_agents)
+        brains.lr = args_cli.lr
         obs, _ = env.reset()
+        rew_names = list(u._episode_sums.keys())
+        rew_rec = []
         alive = torch.ones(n_envs, dtype=torch.bool, device=device)
         first_crash = np.full(n_envs, T)
         reasons = np.zeros((n_envs, len(CRASH_REASONS)), dtype=bool)
@@ -294,14 +320,25 @@ def main():
 
         for t in range(T):
             obs_all = torch.cat([obs[a] for a in agents], dim=0)
+            if args_cli.zero_id:
+                obs_all[:, 12:15] = 0.0
+            if args_cli.freeze_after >= 0 and t * u.step_dt >= args_cli.freeze_after:
+                brains.lr = 0.0
             mask = alive.repeat(n_agents)
             if wrec:
                 wrec.before(t, obs_all, bool(alive[args_cli.record_env]))
-            acts = brains.act(obs_all, update_mask=mask) * mask.unsqueeze(1)
+            gate = (obs_all[:, 33:36].norm(dim=1) / hebb_gate).clamp(max=1.0) if hebb_gate > 0 else None
+            acts = brains.act(obs_all, update_mask=mask, gate=gate) * mask.unsqueeze(1)
             if wrec:
                 wrec.after(mask)
             acts = acts.view(n_agents, n_envs, -1)
+            prev_sums = torch.stack([u._episode_sums[k].clone() for k in rew_names], 1)
             obs, rewards, terminated, truncated, _ = env.step({a: acts[i] for i, a in enumerate(agents)})
+            # reward of this step, per term (the env zeroes its sums for envs it resets -> NaN there)
+            inc = torch.stack([u._episode_sums[k] for k in rew_names], 1) - prev_sums
+            ended = (terminated[agents[0]].reshape(-1) | truncated[agents[0]].reshape(-1)).bool()
+            inc[ended] = float("nan")
+            rew_rec.append(inc.float().cpu().numpy())
 
             alive_before = alive.clone()
             rec["drones"].append(snap["drones"].cpu().numpy())
@@ -341,7 +378,9 @@ def main():
                             goal_R=np.stack(rec["goal_R"]), load_linvel=np.stack(rec["load_linvel"]),
                             load_angvel=np.stack(rec["load_angvel"]),
                             reason_names=np.array(CRASH_REASONS), step_dt=u.step_dt, payload_mass=mass,
-                            hebbian_lr=args_cli.lr,
+                            hebbian_lr=args_cli.lr, hebb_decay=hebb_decay, hebb_gate=hebb_gate,
+                            rew_terms=np.stack(rew_rec), rew_names=np.array(rew_names),   # (T, n_envs, terms)
+                            freeze_after=args_cli.freeze_after, zero_id=args_cli.zero_id,
                             bbox=float(getattr(u.cfg, "bounding_box_threshold", 5.0)))
         if wrec:
             wpath = os.path.join(out_dir, f"weights_ep{ep}.npz")

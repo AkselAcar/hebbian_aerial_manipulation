@@ -195,7 +195,12 @@ class OpenAIES(EA):
             raise ValueError("OpenAI-ES uses mirrored pairs: pop_size must be even")
         self.D = params["D"]
         self.sigma = params.get("sigma0", 0.05)          # fixed noise std
-        self.lr = params.get("es_lr", 0.01)               # Adam step size
+        self.lr = params.get("es_lr", 0.01)               # Adam step size (start value)
+        self.lr0 = self.lr
+        self.lr_schedule = params.get("lr_schedule", "const")      # "const" or "cosine"
+        self.lr_total_gens = max(1, int(params.get("lr_total_gens", 1000)))
+        self.lr_min = self.lr0 * params.get("lr_min_frac", 0.1)
+        self.gen = 0                                                # generations done
         self.weight_decay = params.get("weight_decay", 0.005)
         self.es_optimizer = params.get("es_optimizer", "adam")   # "adam" or "sgd"
         if self.es_optimizer not in ("adam", "sgd"):
@@ -244,6 +249,10 @@ class OpenAIES(EA):
         grad = ranks @ self.eps / (self.Np * self.sigma)
         grad -= self.weight_decay * self.theta           # L2 penalty, as in the paper
 
+        if self.lr_schedule == "cosine":              # lr0 -> lr_min over lr_total_gens, then stays at lr_min
+            frac = min(self.gen / self.lr_total_gens, 1.0)
+            self.lr = self.lr_min + 0.5 * (self.lr0 - self.lr_min) * (1 + np.cos(np.pi * frac))
+        self.gen += 1
         if self.es_optimizer == "sgd":
             step = self.lr * grad                     # plain gradient ascent
         else:                                         # Adam ascent step

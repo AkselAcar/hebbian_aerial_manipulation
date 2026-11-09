@@ -16,6 +16,12 @@ A genome of length n (static baseline) means A = B = C = D = 0.
 
 Brain b = agent * n_envs + env.  Env j runs genome j % pop_size, so all
 drones and all reps of a genome start from the same weights and rules.
+
+Optional plasticity brakes (both off by default, so old genomes behave exactly as before):
+    decay  : every step  W += dW - decay * (W - W_start)   -> weights relax back towards their
+             evolved start values; a constant push settles at an offset instead of drifting forever
+    gate   : dW is multiplied by a per-brain factor in [0, 1] given to act(), e.g. how far that
+             drone's payload is from the goal -> little learning when things are fine
 """
 
 import torch
@@ -23,13 +29,14 @@ import torch
 
 class BatchedHebbian:
     def __init__(self, n_states=45, n_hidden=17, n_actions=5, lr=0.001,
-                 max_lin_acc=5.0, max_body_rate=2.0, device="cuda", dtype=torch.float32):
+                 max_lin_acc=5.0, max_body_rate=2.0, device="cuda", dtype=torch.float32, decay=0.0):
         self.ns, self.nh, self.na = n_states, n_hidden, n_actions
         self.n1 = n_hidden * n_states          # 765 synapses input -> hidden1
         self.n2 = n_hidden * n_hidden          # 289 synapses hidden1 -> hidden2
         self.n3 = n_actions * n_hidden         # 85 synapses hidden2 -> output
         self.n_syn = self.n1 + self.n2 + self.n3  # 1139
         self.lr = lr
+        self.decay = decay            # per step, 0 = off
         self.device, self.dtype = device, dtype
 
         self.action_scale = torch.tensor([max_lin_acc] * 3 + [max_body_rate] * 2,
@@ -69,6 +76,7 @@ class BatchedHebbian:
                     x[:, self.n1 + self.n2:].reshape(-1, self.na, self.nh))
 
         self.W1, self.W2, self.Wo = [w.clone() for w in split(blocks[:, 0])]
+        self.W_start = [w.clone() for w in (self.W1, self.W2, self.Wo)]   # for the decay
         self.A = split(blocks[:, 1])
         self.B = split(blocks[:, 2])
         self.C = split(blocks[:, 3])
@@ -76,12 +84,13 @@ class BatchedHebbian:
 
     # ------------------------------------------------------------------- step
     @torch.no_grad()
-    def act(self, obs, update_mask=None):
+    def act(self, obs, update_mask=None, gate=None):
         """obs: (n_brains, n_states). Returns actions (n_brains, n_actions).
 
         update_mask: bool (n_brains,), True = this brain's weights get the
         Hebbian update (False for swarms that already crashed, so their
         weights stay frozen exactly like the numpy loop, which skipped them).
+        gate: optional float (n_brains,) in [0, 1] that scales this step's Hebbian update.
         """
         s = obs.to(self.dtype) / self.state_div
         x1 = torch.tanh(torch.bmm(self.W1, s.unsqueeze(-1))).squeeze(-1)
@@ -89,10 +98,15 @@ class BatchedHebbian:
         out = torch.tanh(torch.bmm(self.Wo, x2.unsqueeze(-1))).squeeze(-1)
 
         m = None if update_mask is None else update_mask.to(self.dtype).view(-1, 1, 1)
+        g = None if gate is None else gate.to(self.dtype).view(-1, 1, 1)
         for W, k, pre, post in ((self.W1, 0, s, x1), (self.W2, 1, x1, x2), (self.Wo, 2, x2, out)):
             pre_ = pre.unsqueeze(1)     # (b, 1, n_pre)
             post_ = post.unsqueeze(2)   # (b, n_post, 1)
             dW = self.lr * (self.A[k] * post_ * pre_ + self.B[k] * pre_ + self.C[k] * post_ + self.D[k])
+            if g is not None:
+                dW = dW * g
+            if self.decay > 0:
+                dW = dW - self.decay * (W - self.W_start[k])
             W += dW if m is None else dW * m
 
         return out * self.action_scale
