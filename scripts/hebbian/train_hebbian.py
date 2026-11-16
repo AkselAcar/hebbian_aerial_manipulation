@@ -1,6 +1,15 @@
 """
 Hebbian / evolution-strategy training for the flycrane hover task (version 8).
 
+v8.2: neuromodulation on the orientation too: --hebb_gate_att A (deg) adds the payload attitude error
+    to the plasticity gate, m = min(1, max(pos err / hebb_gate, att err / A)) (--hebb_gate_mode mean:
+    the average of the two instead). Works alone too (--hebb_gate 0 --hebb_gate_att 45).
+
+v8.1: fix: curriculum ranges are plain floats (numpy float64 crashed Isaac's reset, heading curriculum).
+    Logged every generation, over the flights that lasted the whole episode: payload-goal distance and
+    attitude error at the end (pos_err_end_full, att_err_end_deg_full) and averaged over the flight
+    (pos_err_mean_full, att_err_mean_deg_full) -> learning curves of the actual task.
+
 v8: curricula and reward weights (step 2, all off by default):
     --curr_yaw_gens N    heading change asked grows from --curr_yaw0 (15 deg) to the full task over N gens
     --curr_tilt_gens M   then goal tilt grows from 0 to +-45 deg over M gens
@@ -83,6 +92,10 @@ parser.add_argument("--hebb_decay", type=float, default=0.0,
                     help="plasticity brake: weights relax to their start values at this rate [1/s] (0 = off)")
 parser.add_argument("--hebb_gate", type=float, default=0.0,
                     help="plasticity brake: Hebbian update scaled by min(1, |goal pos error| / this) [m] (0 = off)")
+parser.add_argument("--hebb_gate_att", type=float, default=0.0,
+                    help="neuromodulation on the orientation too: attitude error scale [deg] (0 = off)")
+parser.add_argument("--hebb_gate_mode", choices=["max", "mean"], default="max",
+                    help="how the position and attitude terms are combined (see plasticity_gate)")
 # --- step 2: curricula and reward weights (all off by default) -------------------------------
 parser.add_argument("--curr_yaw_gens", type=int, default=0,
                     help="heading curriculum: max heading change grows from --curr_yaw0 to the full task over N gens")
@@ -162,6 +175,28 @@ def flat(x):
     return x.reshape(-1)
 
 
+def plasticity_gate(obs_all, gate_pos, gate_att, mode="max"):
+    """Neuromodulation of the Hebbian update, per drone (None = no gate).
+
+    Each drone sees the payload's goal errors in its own observation:
+      position error  |obs[33:36]| [m]                -> e_p = error / gate_pos
+      attitude error  angle of the matrix obs[36:45]  -> e_a = error / gate_att [deg]
+    m = min(1, e)  with  e = max(e_p, e_a)  ("keep adapting while either error is large")
+                    or   e = mean(e_p, e_a) (mode "mean"); a term with gate 0 is left out.
+    """
+    terms = []
+    if gate_pos > 0:
+        terms.append(obs_all[:, 33:36].norm(dim=1) / gate_pos)
+    if gate_att > 0:
+        R = obs_all[:, 36:45].reshape(-1, 3, 3)
+        cos = ((R.diagonal(dim1=1, dim2=2).sum(1) - 1) / 2).clamp(-1, 1)
+        terms.append(torch.rad2deg(torch.arccos(cos)) / gate_att)
+    if not terms:
+        return None
+    e = terms[0] if len(terms) == 1 else (torch.maximum(*terms) if mode == "max" else 0.5 * (terms[0] + terms[1]))
+    return e.clamp(max=1.0)
+
+
 def ramp(gen, start, n, a, b):
     """a before generation `start`, b from `start + n` on, linear in between."""
     if gen < start:
@@ -208,9 +243,9 @@ class Curriculum:
     @staticmethod
     def _sym(full, half):
         """Symmetric range +-half around the centre of `full`, never wider than `full`."""
-        mid, fh = 0.5 * (full[0] + full[1]), 0.5 * (full[1] - full[0])
-        h = min(half, fh)
-        return (mid - h, mid + h)
+        mid, fh = 0.5 * float(full[0] + full[1]), 0.5 * float(full[1] - full[0])
+        h = min(float(half), fh)
+        return (float(mid - h), float(mid + h))   # plain floats: numpy float64 makes Isaac's reset tensors float64 -> crash
 
     def apply(self, gen):
         a, f, u = self.a, self.full, self.u
@@ -233,12 +268,12 @@ class Curriculum:
         s["curr_z_half_range"] = min(hz, z_full)
         # reward weights
         if a.pos_weight_end is not None:
-            u.cfg.pos_track_weight = ramp(gen, 0, a.pos_weight_gens, f["pos_w"], a.pos_weight_end)
+            u.cfg.pos_track_weight = float(ramp(gen, 0, a.pos_weight_gens, f["pos_w"], a.pos_weight_end))
         s["pos_weight_now"] = float(u.cfg.pos_track_weight)
         s["calm_weight_now"] = float(getattr(u.cfg, CALM_TERMS[0]))
         # drone collision
         if a.collision_off_gens:
-            u.cfg.drone_collision_threshold = ramp(gen, a.collision_off_gens, a.collision_ramp_gens, 0.0, f["coll"])
+            u.cfg.drone_collision_threshold = float(ramp(gen, a.collision_off_gens, a.collision_ramp_gens, 0.0, f["coll"]))
         s["collision_dist_now"] = float(u.cfg.drone_collision_threshold)
         try:  # some Isaac Lab versions keep a copy: hand the changed term back
             u.event_manager.set_term_cfg("reset_base", self.reset_term)
@@ -253,13 +288,18 @@ class Curriculum:
         return w * self.u.step_dt * T
 
 
-def start_errors(obs0):
-    """What the reset actually asked for (from drone 0's observation): start distance to the goal,
-    start attitude error and start payload height. Used to check that the curriculum takes effect."""
+def pose_errors(obs0):
+    """Payload-goal distance [m] and attitude error [deg] of every env, from drone 0's observation."""
     pos_err = obs0[:, 33:36].norm(dim=1)
     R = obs0[:, 36:45].reshape(-1, 3, 3)                      # goal rotation x payload rotation^T
     cos = ((R.diagonal(dim1=1, dim2=2).sum(1) - 1) / 2).clamp(-1, 1)
-    att = torch.rad2deg(torch.arccos(cos))
+    return pos_err, torch.rad2deg(torch.arccos(cos))
+
+
+def start_errors(obs0):
+    """What the reset actually asked for (from drone 0's observation): start distance to the goal,
+    start attitude error and start payload height. Used to check that the curriculum takes effect."""
+    pos_err, att = pose_errors(obs0)
     z = obs0[:, 2]
     return {"start_pos_err_mean": float(pos_err.mean()), "start_att_err_deg_mean": float(att.mean()),
             "start_att_err_deg_p90": float(torch.quantile(att.float(), 0.9)),
@@ -269,7 +309,10 @@ def start_errors(obs0):
 CURR_FIELDS = ["curr_heading_change_max_deg", "curr_tilt_max_deg", "curr_z_half_range",
                "pos_weight_now", "calm_weight_now", "collision_dist_now", "fitness_max_per_drone",
                "start_pos_err_mean", "start_att_err_deg_mean", "start_att_err_deg_p90",
-               "start_payload_z_min", "start_payload_z_max"]
+               "start_payload_z_min", "start_payload_z_max",
+               # learning curves of the actual task, over the flights that lasted the whole episode:
+               # error at the end (last state before the final step) and averaged over the flight
+               "pos_err_end_full", "att_err_end_deg_full", "pos_err_mean_full", "att_err_mean_deg_full"]
 
 
 def main():
@@ -335,7 +378,8 @@ def main():
     brains = BatchedHebbian(n_input, n_hidden, n_output, lr=args_cli.lr, device=device,
                             decay=args_cli.hebb_decay * u.step_dt)       # per-second rate -> per step
     print(f"lr schedule {args_cli.lr_schedule} (total {args_cli.lr_total_gens} gens, min {args_cli.lr_min_frac} x es_lr) | "
-          f"plasticity brakes: decay {args_cli.hebb_decay}/s, gate {args_cli.hebb_gate} m", flush=True)
+          f"plasticity brakes: decay {args_cli.hebb_decay}/s, gate {args_cli.hebb_gate} m, "
+          f"{args_cli.hebb_gate_att} deg ({args_cli.hebb_gate_mode})", flush=True)
     with open(os.path.join(results_dir, "train_args.json"), "w") as f:
         json.dump({**vars(args_cli), "step_dt": u.step_dt, "D": D}, f, indent=1, default=str)
     scale = brains.action_scale                                   # [5, 5, 5, 2, 2]
@@ -393,15 +437,21 @@ def main():
         act_abs_sum = torch.zeros(n_output, device=device)             # sum of |command| / limit
         act_rows = torch.zeros((), device=device)
         crash_counts = torch.zeros(len(CRASH_REASONS), device=device)
+        pos_last = att_last = None
+        pos_sum = torch.zeros(n_envs, device=device)                  # sum over steps of the pose errors
+        att_sum = torch.zeros(n_envs, device=device)
         n_crashed = torch.zeros((), device=device)
 
         for t in range(T):
+            # payload pose error of the state the drones see now (valid for envs still alive)
+            pe, ae = pose_errors(obs[agents[0]])
+            pos_last = torch.where(alive, pe, pos_last) if t else pe.clone()
+            att_last = torch.where(alive, ae, att_last) if t else ae.clone()
+            pos_sum += pe * alive; att_sum += ae * alive
             # all drones of all envs in one batch: brain b = agent * n_envs + env
             obs_all = torch.cat([obs[a] for a in agents], dim=0)
             mask = alive.repeat(n_agents)
-            gate = None
-            if args_cli.hebb_gate > 0:                         # each drone sees its own goal error (obs 33:36, m)
-                gate = (obs_all[:, 33:36].norm(dim=1) / args_cli.hebb_gate).clamp(max=1.0)
+            gate = plasticity_gate(obs_all, args_cli.hebb_gate, args_cli.hebb_gate_att, args_cli.hebb_gate_mode)
             acts = brains.act(obs_all, update_mask=mask, gate=gate)   # crashed swarms: weights frozen
             acts = acts * mask.unsqueeze(1)                    # crashed swarms: zero commands
 
@@ -439,6 +489,13 @@ def main():
                 break  # every env has terminated once: nothing left to measure
 
         # --- back to numpy for the optimizer and the log ------------------------
+        full = steps_survived >= T                                     # flights without any termination
+        nf = max(int(full.sum()), 1)
+        n_seen = max(steps_simulated, 1)
+        curr_now.update({"pos_err_end_full": float(pos_last[full].sum()) / nf if full.any() else np.nan,
+                         "att_err_end_deg_full": float(att_last[full].sum()) / nf if full.any() else np.nan,
+                         "pos_err_mean_full": float(pos_sum[full].sum()) / (nf * n_seen) if full.any() else np.nan,
+                         "att_err_mean_deg_full": float(att_sum[full].sum()) / (nf * n_seen) if full.any() else np.nan})
         fitness_env = fitness_env.cpu().numpy()
         steps_survived = steps_survived.cpu().numpy()
         n_act = max(float(act_rows), 1.0)
@@ -511,6 +568,8 @@ def main():
                   f"{curr_now['start_pos_err_mean']:.2f} m, {curr_now['start_att_err_deg_mean']:.0f} deg "
                   f"(90%: {curr_now['start_att_err_deg_p90']:.0f}) | max fitness {curr_now['fitness_max_per_drone']:.1f}",
                   flush=True)
+        print(f"    full flights: end error {curr_now['pos_err_end_full']:.2f} m / {curr_now['att_err_end_deg_full']:.0f} deg, "
+              f"mean over flight {curr_now['pos_err_mean_full']:.2f} m / {curr_now['att_err_mean_deg_full']:.0f} deg", flush=True)
         top = sorted(zip(CRASH_REASONS, crash_frac), key=lambda kv: -kv[1])[:3]
         print("    first-crash reasons: " + ", ".join(f"{k} {v:.0%}" for k, v in top if v > 0),
               flush=True)

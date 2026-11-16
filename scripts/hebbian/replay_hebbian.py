@@ -56,6 +56,16 @@ parser.add_argument("--hebb_decay", type=float, default=None,
                     help="plasticity brake [1/s] (default: the value in <results_dir>/train_args.json, else 0)")
 parser.add_argument("--hebb_gate", type=float, default=None,
                     help="plasticity gate [m] (default: the value in <results_dir>/train_args.json, else 0)")
+parser.add_argument("--hebb_gate_att", type=float, default=None,
+                    help="attitude part of the gate [deg] (default: train_args.json, else 0)")
+parser.add_argument("--hebb_gate_mode", choices=["max", "mean"], default=None,
+                    help="how position and attitude gates combine (default: train_args.json, else max)")
+parser.add_argument("--seed", type=int, default=0,
+                    help="random seed of the starts and goals; episode k uses seed+k, so every controller replayed "
+                         "with the same seed flies exactly the same start/goal pairs (-1 = new random ones)")
+parser.add_argument("--zero_action", action="store_true",
+                    help="hover test: every drone gets the action 0 (no acceleration, no body rate); the network "
+                         "is not used. Shows where the payload settles on its own (prints its tilt over time)")
 parser.add_argument("--freeze_after", type=float, default=-1,
                     help="switch plasticity off after this many seconds of each flight (default: never)")
 parser.add_argument("--zero_id", action="store_true", help="set the one-hot drone ID inputs (12:15) to 0")
@@ -166,6 +176,28 @@ class WeightRecorder:
                             w0_abs=self.W0.abs().mean(1)[: self.b.n_envs].cpu().numpy())
 
 
+def plasticity_gate(obs_all, gate_pos, gate_att, mode="max"):
+    """Neuromodulation of the Hebbian update, per drone (None = no gate).
+
+    Each drone sees the payload's goal errors in its own observation:
+      position error  |obs[33:36]| [m]                -> e_p = error / gate_pos
+      attitude error  angle of the matrix obs[36:45]  -> e_a = error / gate_att [deg]
+    m = min(1, e)  with  e = max(e_p, e_a)  ("keep adapting while either error is large")
+                    or   e = mean(e_p, e_a) (mode "mean"); a term with gate 0 is left out.
+    """
+    terms = []
+    if gate_pos > 0:
+        terms.append(obs_all[:, 33:36].norm(dim=1) / gate_pos)
+    if gate_att > 0:
+        R = obs_all[:, 36:45].reshape(-1, 3, 3)
+        cos = ((R.diagonal(dim1=1, dim2=2).sum(1) - 1) / 2).clamp(-1, 1)
+        terms.append(torch.rad2deg(torch.arccos(cos)) / gate_att)
+    if not terms:
+        return None
+    e = terms[0] if len(terms) == 1 else (torch.maximum(*terms) if mode == "max" else 0.5 * (terms[0] + terms[1]))
+    return e.clamp(max=1.0)
+
+
 def payload_masses(u, body="load_link"):
     """Payload mass of every env as the simulator currently sees it (None if not readable)."""
     try:
@@ -232,6 +264,8 @@ def main():
     env_cfg = MARLHoverEnvCfg()
     env_cfg.scene.num_envs = n_envs
     env_cfg.history_len = 1
+    if args_cli.seed >= 0:
+        env_cfg.seed = args_cli.seed
     if args_cli.payload_mass is not None:
         env_cfg.events.randomize_mass.params["mass_distribution_params"] = (args_cli.payload_mass,) * 2
     if args_cli.video:
@@ -281,9 +315,13 @@ def main():
             targs = json.load(f)
     hebb_decay = args_cli.hebb_decay if args_cli.hebb_decay is not None else float(targs.get("hebb_decay", 0.0))
     hebb_gate = args_cli.hebb_gate if args_cli.hebb_gate is not None else float(targs.get("hebb_gate", 0.0))
+    hebb_gate_att = (args_cli.hebb_gate_att if args_cli.hebb_gate_att is not None
+                     else float(targs.get("hebb_gate_att", 0.0)))
+    hebb_gate_mode = args_cli.hebb_gate_mode or targs.get("hebb_gate_mode", "max")
     if targs and abs(float(targs.get("lr", args_cli.lr)) - args_cli.lr) > 1e-12:
         print(f"WARNING: trained with Hebbian lr {targs.get('lr')}, replaying with {args_cli.lr}", flush=True)
-    print(f"plasticity brakes: decay {hebb_decay}/s, gate {hebb_gate} m", flush=True)
+    print(f"plasticity brakes: decay {hebb_decay}/s, gate {hebb_gate} m, {hebb_gate_att} deg ({hebb_gate_mode})",
+          flush=True)
     brains = BatchedHebbian(lr=args_cli.lr, device=device, decay=hebb_decay * u.step_dt)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     label = args_cli.which if args_cli.which == "theta" or args_cli.best_gen == -1 else f"best_gen{args_cli.best_gen}"
@@ -295,15 +333,21 @@ def main():
         label += f"_freeze{args_cli.freeze_after:g}s"
     if args_cli.zero_id:
         label += "_noid"
+    if args_cli.zero_action:
+        label = "zero_action"                           # the genome is not used
     out_dir = os.path.join(args_cli.results_dir, f"replay_{label}_{stamp}")
     os.makedirs(out_dir, exist_ok=True)
-    summary = [f"genome: {args_cli.which} from {args_cli.results_dir}, Hebbian lr {args_cli.lr}, payload {mass:.3f} kg",
+    summary = [f"genome: {args_cli.which} from {args_cli.results_dir}, Hebbian lr {args_cli.lr}, payload {mass:.3f} kg, "
+               f"seed {args_cli.seed}",
                f"bounding box: ±{getattr(u.cfg, 'bounding_box_threshold', '?')} m (drone positions, any axis)", ""]
     all_survived = []
 
     for ep in range(args_cli.n_episodes):
         brains.load(genome[None, :], n_envs, n_agents)
         brains.lr = args_cli.lr
+        if args_cli.seed >= 0:                       # same start/goal pairs for every controller
+            torch.manual_seed(args_cli.seed + ep)
+            np.random.seed(args_cli.seed + ep)
         obs, _ = env.reset()
         rew_names = list(u._episode_sums.keys())
         rew_rec = []
@@ -327,8 +371,10 @@ def main():
             mask = alive.repeat(n_agents)
             if wrec:
                 wrec.before(t, obs_all, bool(alive[args_cli.record_env]))
-            gate = (obs_all[:, 33:36].norm(dim=1) / hebb_gate).clamp(max=1.0) if hebb_gate > 0 else None
+            gate = plasticity_gate(obs_all, hebb_gate, hebb_gate_att, hebb_gate_mode)
             acts = brains.act(obs_all, update_mask=mask, gate=gate) * mask.unsqueeze(1)
+            if args_cli.zero_action:
+                acts = torch.zeros_like(acts)
             if wrec:
                 wrec.after(mask)
             acts = acts.view(n_agents, n_envs, -1)
@@ -379,6 +425,7 @@ def main():
                             load_angvel=np.stack(rec["load_angvel"]),
                             reason_names=np.array(CRASH_REASONS), step_dt=u.step_dt, payload_mass=mass,
                             hebbian_lr=args_cli.lr, hebb_decay=hebb_decay, hebb_gate=hebb_gate,
+                            hebb_gate_att=hebb_gate_att, seed=args_cli.seed, hebb_gate_mode=hebb_gate_mode, zero_action=args_cli.zero_action,
                             rew_terms=np.stack(rew_rec), rew_names=np.array(rew_names),   # (T, n_envs, terms)
                             freeze_after=args_cli.freeze_after, zero_id=args_cli.zero_id,
                             bbox=float(getattr(u.cfg, "bounding_box_threshold", 5.0)))
@@ -397,6 +444,15 @@ def main():
             print(f"[video] episode {ep}: {clip}", flush=True)
 
         all_survived.append(first_crash)
+        # payload tilt = angle between its own up axis and the world vertical (0 = level), alive swarms only
+        Rz = np.stack(rec["load_R"])[:, :, 2, 2]                          # (T, n_envs)
+        tilt = np.degrees(np.arccos(np.clip(Rz, -1, 1)))
+        tilt[~np.stack(rec["alive"])] = np.nan
+        line = "payload tilt (median over alive swarms) at " + ", ".join(
+            f"{s_:g} s: {np.nanmedian(tilt[min(int(s_ / u.step_dt), len(tilt) - 1)]):.0f} deg"
+            for s_ in (0, 1, 2, 5, 10, 20) if not np.all(np.isnan(tilt[min(int(s_ / u.step_dt), len(tilt) - 1)])))
+        print(f"episode {ep}: {line}", flush=True)
+        summary.append(f"ep {ep}: {line}")
         for e in range(n_envs):
             r = ", ".join(n for n, f in zip(CRASH_REASONS, reasons[e]) if f) or "never crashed"
             summary.append(f"ep {ep} env {e:3d}: survived {first_crash[e]:5d} steps | {r}")
