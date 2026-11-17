@@ -63,6 +63,10 @@ parser.add_argument("--hebb_gate_mode", choices=["max", "mean"], default=None,
 parser.add_argument("--seed", type=int, default=0,
                     help="random seed of the starts and goals; episode k uses seed+k, so every controller replayed "
                          "with the same seed flies exactly the same start/goal pairs (-1 = new random ones)")
+parser.add_argument("--drone", type=str, default=None,
+                    help="drone model, controllers/drone_params.py: falcon (default) or omninxt")
+parser.add_argument("--robot_usd", type=str, default=None,
+                    help="flycrane USD to load instead of the drone's default one (pipeline checks)")
 parser.add_argument("--zero_action", action="store_true",
                     help="hover test: every drone gets the action 0 (no acceleration, no body rate); the network "
                          "is not used. Shows where the payload settles on its own (prints its tilt over time)")
@@ -262,6 +266,13 @@ def main():
     n_envs, T = args_cli.num_envs, args_cli.episode_steps
 
     env_cfg = MARLHoverEnvCfg()
+    drone = args_cli.drone                                  # default: the drone the run was trained with
+    _tp = os.path.join(args_cli.results_dir, "train_args.json")
+    if drone is None and os.path.isfile(_tp):
+        with open(_tp) as f:
+            drone = json.load(f).get("drone")
+    env_cfg.use_drone(drone or "falcon", args_cli.robot_usd)
+    print(f"drone model: {env_cfg.drone} | USD {env_cfg.robot_cfg.spawn.usd_path}", flush=True)
     env_cfg.scene.num_envs = n_envs
     env_cfg.history_len = 1
     if args_cli.seed >= 0:
@@ -335,6 +346,8 @@ def main():
         label += "_noid"
     if args_cli.zero_action:
         label = "zero_action"                           # the genome is not used
+    if env_cfg.drone != "falcon" or args_cli.robot_usd:
+        label += f"_{env_cfg.drone}" + ("_usd" if args_cli.robot_usd else "")
     out_dir = os.path.join(args_cli.results_dir, f"replay_{label}_{stamp}")
     os.makedirs(out_dir, exist_ok=True)
     summary = [f"genome: {args_cli.which} from {args_cli.results_dir}, Hebbian lr {args_cli.lr}, payload {mass:.3f} kg, "
@@ -352,6 +365,7 @@ def main():
         rew_names = list(u._episode_sums.keys())
         rew_rec = []
         alive = torch.ones(n_envs, dtype=torch.bool, device=device)
+        rotor_sums, alive_steps = torch.zeros(3, device=device), torch.zeros((), device=device)
         first_crash = np.full(n_envs, T)
         reasons = np.zeros((n_envs, len(CRASH_REASONS)), dtype=bool)
         rec = {k: [] for k in ["drones", "load", "goal", "actions", "alive",
@@ -411,6 +425,11 @@ def main():
                     else:
                         frames.append(frame)
 
+            if hasattr(u, "rotor_sat_now"):
+                af = alive.float()
+                rotor_sums += torch.stack([(u.rotor_sat_now * af).sum(), (u.rotor_thrust_frac_now * af).sum(),
+                                           (u.rotor_thrust_frac_max_drone * af).sum()])
+                alive_steps += af.sum()
             alive &= ~(crashed | timed_out)
             if not bool(alive.any()):
                 break
@@ -453,6 +472,12 @@ def main():
             for s_ in (0, 1, 2, 5, 10, 20) if not np.all(np.isnan(tilt[min(int(s_ / u.step_dt), len(tilt) - 1)])))
         print(f"episode {ep}: {line}", flush=True)
         summary.append(f"ep {ep}: {line}")
+        if float(alive_steps) > 0:
+            rot = (rotor_sums / alive_steps).cpu().numpy()
+            line = (f"rotors at the thrust limit {rot[0]:.1%} of the time, mean thrust {rot[1]:.0%} of max, "
+                    f"most loaded drone {rot[2]:.0%}")
+            print(f"episode {ep}: {line}", flush=True)
+            summary.append(f"ep {ep}: {line}")
         for e in range(n_envs):
             r = ", ".join(n for n, f in zip(CRASH_REASONS, reasons[e]) if f) or "never crashed"
             summary.append(f"ep {ep} env {e:3d}: survived {first_crash[e]:5d} steps | {r}")

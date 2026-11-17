@@ -1,5 +1,6 @@
 import torch
 
+from MARL_mav_carry_ext.controllers.drone_params import FALCON, DroneParams
 from MARL_mav_carry_ext.controllers.utils import LowPassFilter
 
 from isaaclab.utils.math import (
@@ -20,7 +21,7 @@ class GeometricController:
 
     """
 
-    def __init__(self, num_envs: int, control_mode: str):
+    def __init__(self, num_envs: int, control_mode: str, params: DroneParams = FALCON):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.num_envs = num_envs
         self.control_mode = control_mode
@@ -42,7 +43,7 @@ class GeometricController:
         # sim and drone parameters
         self.gravity = torch.tensor([[0.0, 0.0, -9.8066]] * self.num_envs, device=self.device)
         self.z_i = torch.tensor([[0.0, 0.0, 1.0]] * self.num_envs, device=self.device)
-        self.falcon_mass = 0.6017  # kg
+        self.falcon_mass = params.mass  # kg (name kept from the Falcon code)
         self._epsilon = torch.tensor(1e-6, device=self.device)  # avoid division by zero
 
         # controller parameters
@@ -50,9 +51,9 @@ class GeometricController:
         self.kd_acc = torch.tensor([4.0, 4.0, 6.0], device=self.device)
         self.ki_acc = torch.tensor([0.0, 0.0, 0.0], device=self.device)
 
-        self.kp_rate = torch.tensor([25.0, 25.0, 8.0], device=self.device)
-        self.kp_att_xy = 150.0
-        self.kp_att_z = 5.0
+        self.kp_rate = torch.tensor(params.kp_rate, device=self.device)
+        self.kp_att_xy = params.kp_att_xy
+        self.kp_att_z = params.kp_att_z
 
         # TODO REMOVE
         # self.kappa = 0.022

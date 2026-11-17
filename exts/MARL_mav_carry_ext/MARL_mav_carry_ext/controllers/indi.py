@@ -1,56 +1,41 @@
 import torch
 
+from MARL_mav_carry_ext.controllers.drone_params import FALCON, DroneParams
 from MARL_mav_carry_ext.controllers.utils import LowPassFilter
 
 from isaaclab.utils.math import quat_inv, quat_apply
 
 
 class IndiController:
-    def __init__(self, num_envs: int):
+    def __init__(self, num_envs: int, params: DroneParams = FALCON):
         self.num_envs = num_envs
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.params = params
 
-        # allocation matrix TODO: define this in a common place with the geometric controller
-        self.kappa = 0.022
-        self.beta = torch.deg2rad(torch.tensor([45], device=self.device))
-        self.l = 0.10606601717798213
-        self.G_1 = torch.tensor(
-            [
-                [1, 1, 1, 1],
-                [
-                    self.l * torch.sin(self.beta),
-                    -self.l * torch.sin(self.beta),
-                    -self.l * torch.sin(self.beta),
-                    self.l * torch.sin(self.beta),
-                ],
-                [
-                    -self.l * torch.cos(self.beta),
-                    -self.l * torch.cos(self.beta),
-                    self.l * torch.cos(self.beta),
-                    self.l * torch.cos(self.beta),
-                ],
-                [self.kappa, -self.kappa, self.kappa, -self.kappa],
-            ],
-            device=self.device,
+        # allocation matrix: [collective thrust; roll; pitch; yaw] = G_1 @ rotor thrusts, with each rotor's arm
+        # (x_i, y_i) measured from the CoM (roll = sum y_i T_i, pitch = -sum x_i T_i, yaw = kappa sum dir_i T_i).
+        # For the Falcon this is exactly the former l*sin(beta) / l*cos(beta) layout (l = 0.10607 m, beta = 45 deg).
+        self.kappa = params.kappa
+        arms = torch.tensor(params.rotor_pos_rel_com, device=self.device)[:, :2]  # (4, 2) x_i, y_i
+        rotor_dir = torch.tensor(params.rotor_dir, device=self.device)
+        self.G_1 = torch.stack(
+            [torch.ones(4, device=self.device), arms[:, 1], -arms[:, 0], self.kappa * rotor_dir], dim=0
         )
         self.G_1_inv = torch.linalg.inv(self.G_1)
 
-        self.motor_inertia_z = 9.3575e-6  # [kgm^2]
+        self.motor_inertia_z = params.motor_inertia  # [kgm^2] (I_p, G_2 is not used)
         self.G_2 = torch.zeros((4, 4), device=self.device)
-        self.G_2[3, :] = torch.tensor(
-            [self.motor_inertia_z, -self.motor_inertia_z, self.motor_inertia_z, -self.motor_inertia_z],
-            device=self.device,
-        )
-        self.motor_omega_min = 150.0  # [rad/s]
-        self.motor_omega_max = 2800.0  # [rad/s]
+        self.G_2[3, :] = self.motor_inertia_z * rotor_dir
+        self.motor_omega_min = params.omega_min  # [rad/s]
+        self.motor_omega_max = params.omega_max  # [rad/s]
         self.thrust_min = 0.0
-        self.thrust_max = 6.25  # [N]
+        self.thrust_max = params.thrust_max  # [N]
         self.thrust_min_collective = 0.0
         self.thrust_max_collective = self.thrust_max * 4  # [N]
-        self.thrust_map = torch.tensor([1.562522e-06, 0.0, 0.0], device=self.device)
+        self.thrust_map = torch.tensor([params.c_t, 0.0, 0.0], device=self.device)
 
-        self.falcon_mass = 0.6017  # kg
-        self.inertia_mat = torch.diag(torch.tensor([0.00164, 0.00184, 0.0030], device=self.device))
+        self.falcon_mass = params.mass  # kg (name kept from the Falcon code)
+        self.inertia_mat = torch.diag(torch.tensor(params.inertia_diag, device=self.device))
         self.rope_offset = -0.03
         self.p_offset = torch.tensor([[0.0, 0.0, self.rope_offset]] * self.num_envs, device=self.device)
 
@@ -80,6 +65,13 @@ class IndiController:
             self.unfiltered_mot = torch.zeros((self.num_envs, 4), device=self.device)
             self.filtered_mot = torch.zeros((self.num_envs, 4), device=self.device)
 
+        # INDI disturbance residual (body frame, 6-dim): the external force/moment the drone MEASURES
+        # beyond its commanded control -- i.e. what the hook+wire imparts, sensed onboard (IMU) WITHOUT any
+        # hook/wall position. [ang(3): alpha_cmd - omega_dot (the INDI angular increment, line ~117);
+        # lin(3): R^T(acc_cmd - a_meas) (commanded vs measured specific force, rotated to body)]. Exposed
+        # here so the hook-grasp env can feed it to its hook-blind actor (onboard-measurable hook signal).
+        self.disturbance_residual = torch.zeros((self.num_envs, 6), device=self.device)
+
     def getCommand(
         self,
         state: dict,
@@ -102,6 +94,13 @@ class IndiController:
         omega_dot = quat_apply(
             quat_inv(state["quat"]), state["ang_acc"]
         )  # body accelerations # normally from derivative filtered body rate
+        # INDI disturbance residual (body frame): angular = the INDI increment (alpha_cmd - omega_dot);
+        # linear = commanded minus measured specific force, rotated into the body frame. Carries the hook/wire
+        # external wrench (onboard-measurable, position-free) for the optional actor observation.
+        self.disturbance_residual = torch.cat(
+            (alpha_cmd - omega_dot, quat_apply(quat_inv(state["quat"]), acc_cmd - state["lin_acc"])),
+            dim=-1,
+        )
         tau = torch.matmul(self.G_1, forces.transpose(0, 1)).transpose(0, 1)[:, 1:]  # torque commands
         mu = torch.zeros((self.num_envs, 4), device=self.device)
         collective_thrust_des_magntiude = torch.norm(acc_cmd, dim=1) * self.falcon_mass
@@ -174,4 +173,5 @@ class IndiController:
     def reset(self, env_ids):
         self.filterMot_.reset(env_ids)
         self.filterRate_.reset(env_ids)
+        self.disturbance_residual[env_ids] = 0.0
         # pass

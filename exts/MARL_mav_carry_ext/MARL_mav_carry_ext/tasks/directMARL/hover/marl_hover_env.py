@@ -14,6 +14,7 @@ from collections.abc import Sequence
 
 from MARL_mav_carry_ext.controllers import GeometricController, IndiController
 from MARL_mav_carry_ext.controllers.motor_model import RotorMotor
+from MARL_mav_carry_ext.controllers.drone_params import get_drone_params
 from MARL_mav_carry_ext.tasks.managerbased.mdp_llc.utils import get_drone_pdist, get_drone_rpos
 
 import isaaclab.sim as sim_utils
@@ -51,6 +52,18 @@ class MARLHoverEnv(DirectMARLEnv):
         self._falcon_rotor_idx = self.robot.find_bodies(cfg.falcon_rotor_names)[0]
         self._payload_idx = self.robot.find_bodies(cfg.payload_name)[0]
         self._rope_idx = self.robot.find_bodies(cfg.rope_name)[0]
+        # Explicit order by body name: drone 1, 2, 3 and rotors 0-3 of each drone. The rotor thrusts are written
+        # as _forces[:, 4 i : 4 i + 4] for drone i, so they must come grouped by drone; a USD converted with
+        # another importer may list the bodies in another order.
+        names = self.robot.body_names
+        for attr in ("_falcon_idx", "_falcon_rotor_idx", "_rope_idx"):
+            found = list(getattr(self, attr))
+            ordered = sorted(found, key=lambda j: names[j])
+            if ordered != found:
+                print(f"[bodies] WARNING {attr}: USD order {[names[j] for j in found]} -> sorted by name", flush=True)
+            setattr(self, attr, ordered)
+        print(f"[bodies] drones {[names[j] for j in self._falcon_idx]} | rotors {[names[j] for j in self._falcon_rotor_idx]}"
+              f" | ropes {[names[j] for j in self._rope_idx]}", flush=True)
 
         # configuration
         self._num_drones = len(self._falcon_idx)
@@ -91,8 +104,10 @@ class MARLHoverEnv(DirectMARLEnv):
 
         # outer loop controller
         self.geo_controllers = {}
+        # drone model (controllers/drone_params.py), chosen by cfg.drone
+        self._drone_params = get_drone_params(self.cfg.drone)
         for i in range(self._num_drones):
-            self.geo_controllers[i] = GeometricController(self.num_envs, self._control_mode)
+            self.geo_controllers[i] = GeometricController(self.num_envs, self._control_mode, self._drone_params)
         self._ll_counter = 0
         self._constant_yaw = torch.zeros([self.num_envs, 1], device=self.device)
         self._zeros = torch.zeros([self.num_envs, 3], device=self.device)
@@ -100,18 +115,30 @@ class MARLHoverEnv(DirectMARLEnv):
         # inner loop controller
         self._indi_controllers = {}
         for i in range(self._num_drones):
-            self._indi_controllers[i] = IndiController(self.num_envs)
+            self._indi_controllers[i] = IndiController(self.num_envs, self._drone_params)
 
         # motor model
         # experimentally obtained
         self.motor_models = {}
-        initial_rpms = [
-            torch.tensor([[1441.5819, 1351.1626, 1341.0111, 1428.5597]], device=self.device).repeat(self.num_envs, 1),
-            torch.tensor([[1377.9199, 1451.8428, 1408.9022, 1329.2014]], device=self.device).repeat(self.num_envs, 1),
-            torch.tensor([[1281.3964, 1293.0708, 1361.7539, 1347.2434]], device=self.device).repeat(self.num_envs, 1),
-        ]
+        if self.cfg.drone == "falcon":
+            initial_rpms = [
+                torch.tensor([[1441.5819, 1351.1626, 1341.0111, 1428.5597]], device=self.device).repeat(self.num_envs, 1),
+                torch.tensor([[1377.9199, 1451.8428, 1408.9022, 1329.2014]], device=self.device).repeat(self.num_envs, 1),
+                torch.tensor([[1281.3964, 1293.0708, 1361.7539, 1347.2434]], device=self.device).repeat(self.num_envs, 1),
+            ]
+        else:
+            # rotor speeds that hold the drone plus an equal share of the payload (only the starting speed:
+            # INDI corrects it within ~0.1 s); the allocation G_1 accounts for the CoM offset of the rotors
+            dp = self._drone_params
+            g_1 = self._indi_controllers[0].G_1
+            weight = (dp.mass + self.cfg.hover_payload_share_kg) * -self.cfg.sim.gravity[2]
+            wrench = torch.tensor([weight, 0.0, 0.0, 0.0], device=g_1.device)
+            omega = torch.sqrt(torch.linalg.solve(g_1, wrench).clamp_min(0.0) / dp.c_t).to(self.device)
+            initial_rpms = [omega.unsqueeze(0).repeat(self.num_envs, 1) for _ in range(self._num_drones)]
+            print(f"[drone] {dp.name}: start rotor speeds {omega.cpu().numpy().round(0)} rad/s, "
+                  f"max thrust {dp.thrust_max:.2f} N per rotor", flush=True)
         for i in range(self._num_drones):
-            self.motor_models[i] = RotorMotor(self.num_envs, initial_rpms[i])
+            self.motor_models[i] = RotorMotor(self.num_envs, initial_rpms[i], self._drone_params)
         self.sampling_time = self.sim.get_physics_dt() * self.cfg.low_level_decimation
 
         # load buffers
@@ -212,12 +239,15 @@ class MARLHoverEnv(DirectMARLEnv):
             all_thrusts = []
             all_moments = []
 
-            drone_positions = self.robot.data.body_com_state_w.torch[
-                :, self._falcon_idx, :3
-            ] - self.scene.env_origins.unsqueeze(1)
-            drone_orientations = self.robot.data.body_com_state_w.torch[:, self._falcon_idx, 3:7]
-            drone_linear_velocities = self.robot.data.body_com_state_w.torch[:, self._falcon_idx, 7:10]
-            drone_angular_velocities = self.robot.data.body_com_state_w.torch[:, self._falcon_idx, 10:13]
+            # LINK frame of the drone body (at its CoM, body axes). The body_com_* orientation is the frame of the
+            # principal axes of inertia, which off-diagonal inertia terms rotate away from the body axes (for the
+            # Falcon, diagonal inertia at the link origin, both are identical).
+            link_pose = self.robot.data.body_link_pose_w.torch[:, self._falcon_idx]
+            link_vel = self.robot.data.body_link_vel_w.torch[:, self._falcon_idx]
+            drone_positions = link_pose[..., :3] - self.scene.env_origins.unsqueeze(1)
+            drone_orientations = link_pose[..., 3:7]
+            drone_linear_velocities = link_vel[..., :3]
+            drone_angular_velocities = link_vel[..., 3:6]
             drone_linear_accelerations = self.robot.data.body_acc_w.torch[:, self._falcon_idx, :3]
             drone_angular_accelerations = self.robot.data.body_acc_w.torch[:, self._falcon_idx, 3:6]
 
@@ -280,6 +310,11 @@ class MARLHoverEnv(DirectMARLEnv):
             forces = torch.cat(all_thrusts, dim=-1)
             torques = torch.cat(all_moments, dim=-1)
             self._forces[..., 2] = forces
+            # rotor thrust saturation of this low-level step, per env (read by the training / replay scripts)
+            frac = forces / self._drone_params.thrust_max                               # (envs, drones x 4)
+            self.rotor_sat_now = (frac > 0.98).float().mean(dim=1)                      # share of rotors at the limit
+            self.rotor_thrust_frac_now = frac.mean(dim=1)                               # mean thrust / max thrust
+            self.rotor_thrust_frac_max_drone = frac.view(self.num_envs, self._num_drones, 4).mean(-1).amax(dim=1)
             self._moments[..., 2] = torques.view(self.num_envs, self._num_drones, 4).sum(-1)
             self._ll_counter = 0
         self._ll_counter += 1
@@ -313,14 +348,14 @@ class MARLHoverEnv(DirectMARLEnv):
         self.load_vel[:] = self.robot.data.body_com_state_w.torch[:, self._payload_idx, 7:10].squeeze(1)
         self.load_ang_vel[:] = self.robot.data.body_com_state_w.torch[:, self._payload_idx, 10:13].squeeze(1)
 
-        # load state of the drones
-        self.drone_positions[:] = self.robot.data.body_com_state_w.torch[
-            :, self._falcon_idx, :3
-        ] - self.scene.env_origins.unsqueeze(1)
-        self.drone_orientations[:] = self.robot.data.body_com_state_w.torch[:, self._falcon_idx, 3:7]
+        # load state of the drones (link frame, see _apply_action)
+        link_pose = self.robot.data.body_link_pose_w.torch[:, self._falcon_idx]
+        link_vel = self.robot.data.body_link_vel_w.torch[:, self._falcon_idx]
+        self.drone_positions[:] = link_pose[..., :3] - self.scene.env_origins.unsqueeze(1)
+        self.drone_orientations[:] = link_pose[..., 3:7]
         self.drone_rot_matrices[:] = matrix_from_quat(self.drone_orientations)
-        self.drone_linear_velocities[:] = self.robot.data.body_com_state_w.torch[:, self._falcon_idx, 7:10]
-        self.drone_angular_velocities[:] = self.robot.data.body_com_state_w.torch[:, self._falcon_idx, 10:13]
+        self.drone_linear_velocities[:] = link_vel[..., :3]
+        self.drone_angular_velocities[:] = link_vel[..., 3:6]
 
         self.goal_pos_error[:] = self.pose_command_w[:, :3] - self.load_position
         goal_load_matrix = matrix_from_quat(self.pose_command_w[:, 3:7])

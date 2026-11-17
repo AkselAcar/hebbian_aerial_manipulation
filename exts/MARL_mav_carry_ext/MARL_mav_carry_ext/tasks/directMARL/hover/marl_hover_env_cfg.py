@@ -167,7 +167,31 @@ class MARLHoverEnvCfg(DirectMARLEnvCfg):
 
     # low level control
     low_level_decimation: int = 1
-    max_thrust_pp = 6.25  # N
+    max_thrust_pp = 6.25  # N (set by use_drone)
+
+    # drone model: a preset of controllers/drone_params.py, set with use_drone() before creating the env
+    drone: str = "falcon"
+    hover_payload_share_kg = 1.4 / 3  # payload share per drone for the start rotor speeds (non-Falcon drones)
+
+    def use_drone(self, name: str, usd: str | None = None):
+        """Select the drone model: controllers + motor model (drone_params preset) AND the matching flycrane USD.
+        falcon: Jack's USD (unchanged) unless `usd` is given (e.g. the re-converted one, to validate the pipeline);
+        other drones: assets/data/AMR/flycrane_<name>/flycrane_<name>/flycrane_<name>.usda by default, built with
+        scripts/assets/build_flycrane_asset.py."""
+        from pathlib import Path
+
+        from MARL_mav_carry_ext.controllers.drone_params import get_drone_params
+
+        params = get_drone_params(name)
+        self.drone = name
+        self.max_thrust_pp = params.thrust_max
+        if usd is None and name != "falcon":
+            amr = Path(__file__).resolve().parents[3] / "assets/data/AMR"
+            usd = str(amr / f"flycrane_{name}/flycrane_{name}/flycrane_{name}.usda")
+        if usd is not None:
+            if not Path(usd).is_file():
+                raise FileNotFoundError(f"flycrane USD for drone '{name}' not found: {usd} (build it first)")
+            self.robot_cfg = self.robot_cfg.replace(spawn=self.robot_cfg.spawn.replace(usd_path=str(usd)))
 
     # rewards
     pos_track_weight = 1.5

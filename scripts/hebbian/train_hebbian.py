@@ -1,6 +1,13 @@
 """
 Hebbian / evolution-strategy training for the flycrane hover task (version 8).
 
+v8.4: reward weights: --ori_weight_start W (alone: constant, 0 = position-only run), --ori_weight_end /
+    --ori_weight_gens (ramp), --pos_weight_start (with the existing --pos_weight_end / --pos_weight_gens).
+    Rotor thrust saturation logged every generation (rotor_sat_frac, rotor_thrust_frac,
+    rotor_thrust_frac_max_drone); "sat" in the Gen line is the NETWORK's command saturation, not the rotors.
+
+v8.3: --drone falcon|omninxt selects the drone model (controllers/drone_params.py + its flycrane USD).
+
 v8.2: neuromodulation on the orientation too: --hebb_gate_att A (deg) adds the payload attitude error
     to the plasticity gate, m = min(1, max(pos err / hebb_gate, att err / A)) (--hebb_gate_mode mean:
     the average of the two instead). Works alone too (--hebb_gate 0 --hebb_gate_att 45).
@@ -109,12 +116,24 @@ parser.add_argument("--curr_z0", type=float, default=0.1, help="height curriculu
 parser.add_argument("--pos_weight_end", type=float, default=None,
                     help="position reward weight rises linearly from the env value (1.5) to this")
 parser.add_argument("--pos_weight_gens", type=int, default=500, help="generations for that rise")
+parser.add_argument("--pos_weight_start", type=float, default=None,
+                    help="position reward weight at generation 0 (default: env value 1.5)")
+parser.add_argument("--ori_weight_start", type=float, default=None,
+                    help="orientation reward weight at generation 0 (default: env value 1.5). Alone = constant: "
+                         "--ori_weight_start=0 is the position-only run")
+parser.add_argument("--ori_weight_end", type=float, default=None,
+                    help="orientation reward weight after --ori_weight_gens (default: stays at the start value)")
+parser.add_argument("--ori_weight_gens", type=int, default=500, help="generations for the orientation weight ramp")
 parser.add_argument("--calm_weight", type=float, default=None,
                     help="weight of each calm-flight term (smoothness, body rate, force, downwash; env: 0.5)")
 parser.add_argument("--collision_off_gens", type=int, default=0,
                     help="no drone-collision termination for the first N gens, then switched back on gradually")
 parser.add_argument("--collision_ramp_gens", type=int, default=200,
                     help="generations over which the collision distance goes from 0 back to the env value (0.6 m)")
+parser.add_argument("--drone", type=str, default=None,
+                    help="drone model, controllers/drone_params.py: falcon (default) or omninxt")
+parser.add_argument("--robot_usd", type=str, default=None,
+                    help="flycrane USD to load instead of the drone's default one (pipeline checks)")
 parser.add_argument("--tag", type=str, default="",
                     help="Optional label added to the log/results names, e.g. eslr0.001_s0.02")
 AppLauncher.add_app_launcher_args(parser)
@@ -233,12 +252,20 @@ class Curriculum:
         self.full = dict(start_yaw=tuple(pr["yaw"]), goal_yaw=tuple(g["yaw"]),
                          start_z=tuple(pr["z"]), goal_z=tuple(g["pos_z"]),
                          roll=tuple(g["roll"]), pitch=tuple(g["pitch"]),
-                         pos_w=float(u.cfg.pos_track_weight), coll=float(u.cfg.drone_collision_threshold))
+                         pos_w=float(u.cfg.pos_track_weight), ori_w=float(u.cfg.ori_track_weight),
+                         coll=float(u.cfg.drone_collision_threshold))
+        # reward weight ramps: start (default env value) -> end (default: position stays, orientation stays)
+        self.pos_w = (args.pos_weight_start if args.pos_weight_start is not None else self.full["pos_w"],
+                      args.pos_weight_end)
+        ori0 = args.ori_weight_start if args.ori_weight_start is not None else self.full["ori_w"]
+        self.ori_w = (ori0, args.ori_weight_end if args.ori_weight_end is not None else ori0)
+        self.weights_changed = (args.pos_weight_start is not None or args.pos_weight_end is not None
+                                or args.ori_weight_start is not None or args.ori_weight_end is not None)
         if args.calm_weight is not None:
             for k in CALM_TERMS:
                 setattr(u.cfg, k, args.calm_weight)
         self.active = any([args.curr_yaw_gens, args.curr_tilt_gens, args.curr_height_gens,
-                           args.pos_weight_end is not None, args.calm_weight is not None, args.collision_off_gens])
+                           self.weights_changed, args.calm_weight is not None, args.collision_off_gens])
 
     @staticmethod
     def _sym(full, half):
@@ -267,9 +294,11 @@ class Curriculum:
         pr["z"], g["pos_z"] = self._sym(f["start_z"], hz), self._sym(f["goal_z"], hz)
         s["curr_z_half_range"] = min(hz, z_full)
         # reward weights
-        if a.pos_weight_end is not None:
-            u.cfg.pos_track_weight = float(ramp(gen, 0, a.pos_weight_gens, f["pos_w"], a.pos_weight_end))
+        p0, p1 = self.pos_w
+        u.cfg.pos_track_weight = float(ramp(gen, 0, a.pos_weight_gens, p0, p1) if p1 is not None else p0)
+        u.cfg.ori_track_weight = float(ramp(gen, 0, a.ori_weight_gens, *self.ori_w))
         s["pos_weight_now"] = float(u.cfg.pos_track_weight)
+        s["ori_weight_now"] = float(u.cfg.ori_track_weight)
         s["calm_weight_now"] = float(getattr(u.cfg, CALM_TERMS[0]))
         # drone collision
         if a.collision_off_gens:
@@ -307,7 +336,10 @@ def start_errors(obs0):
 
 
 CURR_FIELDS = ["curr_heading_change_max_deg", "curr_tilt_max_deg", "curr_z_half_range",
-               "pos_weight_now", "calm_weight_now", "collision_dist_now", "fitness_max_per_drone",
+               "pos_weight_now", "ori_weight_now", "calm_weight_now", "collision_dist_now", "fitness_max_per_drone",
+               # rotors (alive swarms): share of rotor-time at the thrust limit, mean thrust / limit over all
+               # rotors, and the same for the most loaded drone of each swarm
+               "rotor_sat_frac", "rotor_thrust_frac", "rotor_thrust_frac_max_drone",
                "start_pos_err_mean", "start_att_err_deg_mean", "start_att_err_deg_p90",
                "start_payload_z_min", "start_payload_z_max",
                # learning curves of the actual task, over the flights that lasted the whole episode:
@@ -324,6 +356,9 @@ def main():
     T = args_cli.episode_steps
 
     env_cfg = MARLHoverEnvCfg()
+    args_cli.drone = args_cli.drone or "falcon"            # saved in train_args.json
+    env_cfg.use_drone(args_cli.drone, args_cli.robot_usd)
+    print(f"drone model: {env_cfg.drone} | USD {env_cfg.robot_cfg.spawn.usd_path}", flush=True)
     env_cfg.scene.num_envs = n_envs
     env_cfg.history_len = 1
     if args_cli.mass_range is not None:
@@ -387,7 +422,8 @@ def main():
     if curr.active:
         print(f"curricula: heading {args_cli.curr_yaw_gens} gens (from {args_cli.curr_yaw0} deg), "
               f"tilt {args_cli.curr_tilt_gens} gens, height {args_cli.curr_height_gens} gens (from +-{args_cli.curr_z0} m), "
-              f"pos weight -> {args_cli.pos_weight_end} over {args_cli.pos_weight_gens} gens, "
+              f"pos weight {curr.pos_w[0]} -> {curr.pos_w[1]} over {args_cli.pos_weight_gens} gens, "
+              f"ori weight {curr.ori_w[0]} -> {curr.ori_w[1]} over {args_cli.ori_weight_gens} gens, "
               f"calm weight {args_cli.calm_weight}, collision off {args_cli.collision_off_gens} gens "
               f"(+{args_cli.collision_ramp_gens} ramp)", flush=True)
 
@@ -441,6 +477,8 @@ def main():
         pos_sum = torch.zeros(n_envs, device=device)                  # sum over steps of the pose errors
         att_sum = torch.zeros(n_envs, device=device)
         n_crashed = torch.zeros((), device=device)
+        rotor_sums = torch.zeros(3, device=device)                    # see CURR_FIELDS (rotor_*)
+        alive_steps = torch.zeros((), device=device)
 
         for t in range(T):
             # payload pose error of the state the drones see now (valid for envs still alive)
@@ -465,6 +503,11 @@ def main():
 
             obs, rewards, terminated, truncated, info = env.step(actions)
             steps_simulated = t + 1
+            if hasattr(u, "rotor_sat_now"):                      # env with the rotor saturation read-out
+                af = alive.float()
+                rotor_sums += torch.stack([(u.rotor_sat_now * af).sum(), (u.rotor_thrust_frac_now * af).sum(),
+                                           (u.rotor_thrust_frac_max_drone * af).sum()])
+                alive_steps += af.sum()
 
             r = flat(rewards[agents[0]]).float()
             fitness_env += r * alive              # the step on which a swarm crashes still counts
@@ -496,6 +539,9 @@ def main():
                          "att_err_end_deg_full": float(att_last[full].sum()) / nf if full.any() else np.nan,
                          "pos_err_mean_full": float(pos_sum[full].sum()) / (nf * n_seen) if full.any() else np.nan,
                          "att_err_mean_deg_full": float(att_sum[full].sum()) / (nf * n_seen) if full.any() else np.nan})
+        rot = (rotor_sums / alive_steps.clamp(min=1)).cpu().numpy() if float(alive_steps) > 0 else [np.nan] * 3
+        curr_now.update({"rotor_sat_frac": float(rot[0]), "rotor_thrust_frac": float(rot[1]),
+                         "rotor_thrust_frac_max_drone": float(rot[2])})
         fitness_env = fitness_env.cpu().numpy()
         steps_survived = steps_survived.cpu().numpy()
         n_act = max(float(act_rows), 1.0)
@@ -563,13 +609,16 @@ def main():
         if curr.active:
             print(f"    task: heading change <= {curr_now['curr_heading_change_max_deg']:.0f} deg, "
                   f"tilt <= {curr_now['curr_tilt_max_deg']:.0f} deg, z +-{curr_now['curr_z_half_range']:.2f} m, "
-                  f"pos w {curr_now['pos_weight_now']:.2f}, calm w {curr_now['calm_weight_now']:.2f}, "
+                  f"pos w {curr_now['pos_weight_now']:.2f}, ori w {curr_now['ori_weight_now']:.2f}, calm w {curr_now['calm_weight_now']:.2f}, "
                   f"collision {curr_now['collision_dist_now']:.2f} m | asked at start: "
                   f"{curr_now['start_pos_err_mean']:.2f} m, {curr_now['start_att_err_deg_mean']:.0f} deg "
                   f"(90%: {curr_now['start_att_err_deg_p90']:.0f}) | max fitness {curr_now['fitness_max_per_drone']:.1f}",
                   flush=True)
         print(f"    full flights: end error {curr_now['pos_err_end_full']:.2f} m / {curr_now['att_err_end_deg_full']:.0f} deg, "
-              f"mean over flight {curr_now['pos_err_mean_full']:.2f} m / {curr_now['att_err_mean_deg_full']:.0f} deg", flush=True)
+              f"mean over flight {curr_now['pos_err_mean_full']:.2f} m / {curr_now['att_err_mean_deg_full']:.0f} deg | "
+              f"rotors: at the thrust limit {curr_now['rotor_sat_frac']:.1%} of the time, mean thrust "
+              f"{curr_now['rotor_thrust_frac']:.0%} of max, most loaded drone {curr_now['rotor_thrust_frac_max_drone']:.0%}",
+              flush=True)
         top = sorted(zip(CRASH_REASONS, crash_frac), key=lambda kv: -kv[1])[:3]
         print("    first-crash reasons: " + ", ".join(f"{k} {v:.0%}" for k, v in top if v > 0),
               flush=True)

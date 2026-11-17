@@ -1,23 +1,25 @@
 import torch
 
+from MARL_mav_carry_ext.controllers.drone_params import FALCON, DroneParams
+
 
 class RotorMotor:
-    def __init__(self, num_envs: int, init_omega: torch.Tensor):
+    def __init__(self, num_envs: int, init_omega: torch.Tensor, params: DroneParams = FALCON):
         # motor parameters
         self.init_omega = init_omega
         self.num_envs = num_envs
-        self.motor_omega_min = 150.0
-        self.motor_omega_max = 2800.0
-        self.tau_up = 0.033
-        self.tau_down = 0.033
-        self.motor_inertia = 9.3575e-6
+        self.motor_omega_min = params.omega_min
+        self.motor_omega_max = params.omega_max
+        self.tau_up = params.tau_up
+        self.tau_down = params.tau_down
+        self.motor_inertia = params.motor_inertia
 
         # rotor parameters
-        self.thrust_map = torch.tensor([1.562522e-06, 0.0, 0.0])
-        self.torque_map = torch.tensor([3.4375484e-08, 0.0, 0.0])
+        self.thrust_map = torch.tensor([params.c_t, 0.0, 0.0])
+        self.torque_map = torch.tensor([params.c_q, 0.0, 0.0])  # c_q = kappa * c_t (Falcon: 3.4375484e-08)
 
         self.current_omega = init_omega
-        self.direction = torch.tensor([1.0, -1.0, 1.0, -1.0], device="cuda")
+        self.direction = torch.tensor(params.rotor_dir, device="cuda")
 
     def get_motor_thrusts_moments(self, target_rates: torch.Tensor, sampling_time: float):
         """
