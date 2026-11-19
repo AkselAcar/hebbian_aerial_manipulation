@@ -13,13 +13,17 @@ every episode:
 Positions are read inside the env's own _get_dones() call, i.e. BEFORE Isaac
 Lab auto-resets a crashed env, so the last saved step is the crash itself.
 
-Typical use (inside the container, see replay_hebbian.sh):
+It only evaluates: nothing is trained here. By default the starts and goals come from a fixed seed,
+so every controller replayed with the same seed flies exactly the same flights. The plasticity
+settings (decay, gate) and the drone model are read from the run's train_args.json.
+
+Typical use (inside the container, see the jobs in jobs/, e.g. review_replays.sh):
   # statistics + trajectories, no rendering, many envs in parallel
-  train_hebbian ... replay_hebbian.py --headless --results_dir results/3217661_p512_eslr0.01 \
-      --num_envs 32 --n_episodes 1
-  # one env, several episodes, with video (no --headless!)
-  ... replay_hebbian.py --results_dir results/3217661_p512_eslr0.01 \
-      --num_envs 1 --n_episodes 6 --video --viz newton
+  replay_hebbian.py --headless --results_dir results/<run> --num_envs 32 --n_episodes 2
+  # one env, several episodes, with video (no --headless)
+  replay_hebbian.py --results_dir results/<run> --num_envs 1 --n_episodes 6 --video --viz newton
+  # hover test: every drone gets action 0, the network is not used
+  replay_hebbian.py --headless --results_dir results/<run> --zero_action --num_envs 32
 
 Output: <results_dir>/replay_<which>_<timestamp>/
   ep<k>.npz                        trajectories of episode k (all envs)
@@ -27,7 +31,7 @@ Output: <results_dir>/replay_<which>_<timestamp>/
   summary.txt                      survival and crash reasons per env
   weights_ep<k>.npz                with --record_weights: weights + activations of one swarm
                                    over time, and the weight change rate of all swarms
-Plot them with plot_replay.py.
+Analysis scripts (project folder): diagnose_replay.py (errors table), plot_replay.py, plot_weights.py.
 """
 
 import argparse

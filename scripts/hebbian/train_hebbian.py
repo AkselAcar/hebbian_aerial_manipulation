@@ -1,70 +1,32 @@
-"""
-Hebbian / evolution-strategy training for the flycrane hover task (version 8).
+"""Evolve Hebbian controllers for the flycrane task (3 drones carrying a payload) with an evolution strategy.
 
-v8.5: survival signal: --calm_weight_start S --calm_fade_gens N fades the smoothness, body rate and downwash
-    weights from S to --calm_weight (e.g. 0.5 -> 0 over 300 gens); --force_weight sets the force penalty alone
-    (e.g. 0, kept off from the start). Logged: calm_weight_now, force_weight_now.
+Each generation:
+  1. the optimizer (OpenAI-ES or CMA-ES, utils/EA.py) proposes pop_size genomes;
+  2. every genome is flown n_reps times; all swarms run in parallel in Isaac Lab, and each drone gets
+     its own Hebbian network built from the genome (utils/batched_hebbian.py);
+  3. a swarm's fitness is the reward summed over the episode, up to its first termination (crash);
+     the reps of a genome are averaged;
+  4. the fitnesses go back to the optimizer, which makes the next population.
 
-v8.4: reward weights: --ori_weight_start W (alone: constant, 0 = position-only run), --ori_weight_end /
-    --ori_weight_gens (ramp), --pos_weight_start (with the existing --pos_weight_end / --pos_weight_gens).
-    Rotor thrust saturation logged every generation (rotor_sat_frac, rotor_thrust_frac,
-    rotor_thrust_frac_max_drone); "sat" in the Gen line is the NETWORK's command saturation, not the rotors.
+Genome (--genome): w_abcd = [start weights | A | B | C | D], 5 x 1139 = 5695 values;
+                   w      = start weights only, a static network without plasticity (1139).
+Fitness scale: per drone, a perfect 2000-step episode gives (sum of the reward weights) x 0.01 s x 2000,
+i.e. 100 with the default weights (6 terms summing to 5); the logs also give it as fitness_max_per_drone.
 
-v8.3: --drone falcon|omninxt selects the drone model (controllers/drone_params.py + its flycrane USD).
+Options, grouped (all off / at the env's values unless given):
+  optimizer       --optimizer, --pop_size, --n_reps, --sigma0, --es_lr, --es_optimizer, --weight_decay,
+                  --lr_schedule cosine (with --lr_total_gens, --lr_min_frac), --init_from (warm start)
+  plasticity      --lr (Hebbian learning rate), --hebb_decay (pull back to the start weights, 1/s),
+                  --hebb_gate / --hebb_gate_att / --hebb_gate_mode (scale the update by the position
+                  and/or attitude error)
+  task            --curr_yaw_gens / --curr_tilt_gens / --curr_height_gens (curricula that start easy and
+                  end on the normal task), --collision_off_gens, --mass_range, --drone falcon|omninxt
+  reward weights  --pos_weight_start/_end, --ori_weight_start/_end, --calm_weight, --calm_weight_start
+                  with --calm_fade_gens, --force_weight
 
-v8.2: neuromodulation on the orientation too: --hebb_gate_att A (deg) adds the payload attitude error
-    to the plasticity gate, m = min(1, max(pos err / hebb_gate, att err / A)) (--hebb_gate_mode mean:
-    the average of the two instead). Works alone too (--hebb_gate 0 --hebb_gate_att 45).
+Outputs: logs/generation_log_<run>.csv (one row per generation), and results/<run>/ with the optimizer
+state (theta.npy = the OpenAI-ES centre, the controller we evaluate; x_best.npy) and train_args.json.
 
-v8.1: fix: curriculum ranges are plain floats (numpy float64 crashed Isaac's reset, heading curriculum).
-    Logged every generation, over the flights that lasted the whole episode: payload-goal distance and
-    attitude error at the end (pos_err_end_full, att_err_end_deg_full) and averaged over the flight
-    (pos_err_mean_full, att_err_mean_deg_full) -> learning curves of the actual task.
-
-v8: curricula and reward weights (step 2, all off by default):
-    --curr_yaw_gens N    heading change asked grows from --curr_yaw0 (15 deg) to the full task over N gens
-    --curr_tilt_gens M   then goal tilt grows from 0 to +-45 deg over M gens
-    --curr_height_gens N start/goal height range grows from 1 m +- --curr_z0 (0.1 m) to the full 0.5-1.5 m
-    --pos_weight_end W   position reward weight rises 1.5 -> W over --pos_weight_gens gens
-    --calm_weight w      smoothness, body rate, force and downwash weights all set to w (env: 0.5)
-    --collision_off_gens N  no drone-collision termination for N gens, back on over --collision_ramp_gens
-    Every curriculum ends on the normal task. The current values, what the reset really asked for
-    (start_pos_err_mean, start_att_err_deg_*), and the best possible fitness with the current
-    weights (fitness_max_per_drone) are logged every generation.
-
-v7: --lr_schedule cosine decays the OpenAI-ES learning rate from --es_lr to
-    --lr_min_frac * es_lr over --lr_total_gens generations (current value logged as es_lr_now).
-    Plasticity brakes: --hebb_decay L (1/s) pulls every weight back towards its evolved start
-    value with time constant 1/L; --hebb_gate E (m) scales each drone's Hebbian update by
-    min(1, |goal position error| / E). All training options are saved in
-    results/<run>/train_args.json, and replay_hebbian.py reads the brakes from there.
-
-v6: --mass_range LO HI draws a new payload mass (kg, uniform) for every env at
-    every reset, i.e. every generation (default: fixed 1.4 kg as before).
-    --init_from <theta.npy> starts the search from a trained genome instead of
-    zeros (warm start). The payload masses of each generation are logged
-    (payload_mass_min / _mean / _max) so the randomization can be checked.
-
-v5: the controllers of all swarms run as ONE batched GPU computation
-    (utils/batched_hebbian.py) instead of one numpy call per drone per env per
-    step. Same maths as Controllers.hebbianNNController (checked to ~1e-15),
-    so results stay comparable with earlier runs, but generations are much
-    faster, which makes larger populations affordable. Fitness, reps and the
-    bookkeeping (alive mask, steps survived, crash reasons, ...) also stay on
-    the GPU, so the only CPU<->GPU traffic per step is one "anyone alive?" check.
-v4: --optimizer chooses CMA-ES (default) or OpenAI-ES.
-v3: diagnostics: weight size before/after each episode (w_abs_start /
-    w_abs_end), mean command size as a fraction of the limits (act_acc_frac /
-    act_rate_frac), first-crash reasons (crash_<condition> = share of crashed swarms).
-v2: alive mask (reward counts only until a swarm's first termination),
-    parallel reps (env j runs genome j % pop_size), steps survived logging.
-
-Genome (--genome): w_abcd = [start weights | A | B | C | D] (5 x 1139 = 5695),
-                   w      = start weights only, no plasticity (1139).
-
-Fitness scales: per drone, the maximum for a perfect 2000-step episode is
-100 (6 reward terms, weights summing to 5 x step_dt 0.01 x 2000 steps). Summed
-over the 3 drones the maximum is 300.
 """
 
 import argparse
@@ -75,7 +37,7 @@ import time
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Hebbian/ES training for flycrane hover (v5, batched)")
+parser = argparse.ArgumentParser(description="Hebbian/ES training for the flycrane hover task")
 parser.add_argument("--task", type=str, default="Isaac-flycrane-payload-decentralized-hovering-v0")
 parser.add_argument("--pop_size", type=int, default=2, help="Population size (must be even for OpenAI-ES)")
 parser.add_argument("--n_reps", type=int, default=3, help="Evaluations per genome (run in parallel)")
@@ -107,7 +69,7 @@ parser.add_argument("--hebb_gate_att", type=float, default=0.0,
                     help="neuromodulation on the orientation too: attitude error scale [deg] (0 = off)")
 parser.add_argument("--hebb_gate_mode", choices=["max", "mean"], default="max",
                     help="how the position and attitude terms are combined (see plasticity_gate)")
-# --- step 2: curricula and reward weights (all off by default) -------------------------------
+# --- curricula and reward weights (all off by default) --------------------------------------
 parser.add_argument("--curr_yaw_gens", type=int, default=0,
                     help="heading curriculum: max heading change grows from --curr_yaw0 to the full task over N gens")
 parser.add_argument("--curr_yaw0", type=float, default=15.0, help="heading curriculum: first max heading change [deg]")
@@ -239,7 +201,7 @@ CALM_TERMS = ("action_smoothness_weight", "body_rate_penalty_weight", "force_pen
 
 
 class Curriculum:
-    """Step 2: changes the task before each generation's env.reset().
+    """Changes the task before each generation's env.reset().
 
     Every curriculum ends exactly on the env's normal values, so after it the task is the usual one.
     - heading: the start heading (reset_base yaw) and the goal heading (goal_range yaw) are both drawn
@@ -469,7 +431,7 @@ def main():
         "es_step_norm",                                       # OpenAI-ES: size of the last update
         "payload_mass_min", "payload_mass_mean", "payload_mass_max",  # kg, this generation
         "es_lr_now",                                          # OpenAI-ES learning rate used this generation
-    ] + CURR_FIELDS + [f"crash_{name}" for name in CRASH_REASONS]   # step 2 values, share of crashed swarms
+    ] + CURR_FIELDS + [f"crash_{name}" for name in CRASH_REASONS]   # task / reward values, share of crashed swarms
     log_file = open(log_path, "w", newline="")
     log_writer = csv.DictWriter(log_file, fieldnames=log_fields)
     log_writer.writeheader()
@@ -483,7 +445,7 @@ def main():
         brains.load(learner.x_new, n_envs, n_agents)
         w_abs_start = brains.mean_abs_w1(agent=0)
 
-        curr_now = curr.apply(gen)       # step 2: set this generation's task (no-op when all off)
+        curr_now = curr.apply(gen)       # set this generation's task and reward weights (no-op when all off)
         curr_now["fitness_max_per_drone"] = curr.fitness_max(T)
         obs, _ = env.reset()
         pm = payload_masses(u)   # masses drawn by this reset
