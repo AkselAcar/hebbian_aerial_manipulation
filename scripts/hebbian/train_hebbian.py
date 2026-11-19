@@ -1,6 +1,10 @@
 """
 Hebbian / evolution-strategy training for the flycrane hover task (version 8).
 
+v8.5: survival signal: --calm_weight_start S --calm_fade_gens N fades the smoothness, body rate and downwash
+    weights from S to --calm_weight (e.g. 0.5 -> 0 over 300 gens); --force_weight sets the force penalty alone
+    (e.g. 0, kept off from the start). Logged: calm_weight_now, force_weight_now.
+
 v8.4: reward weights: --ori_weight_start W (alone: constant, 0 = position-only run), --ori_weight_end /
     --ori_weight_gens (ramp), --pos_weight_start (with the existing --pos_weight_end / --pos_weight_gens).
     Rotor thrust saturation logged every generation (rotor_sat_frac, rotor_thrust_frac,
@@ -124,6 +128,12 @@ parser.add_argument("--ori_weight_start", type=float, default=None,
 parser.add_argument("--ori_weight_end", type=float, default=None,
                     help="orientation reward weight after --ori_weight_gens (default: stays at the start value)")
 parser.add_argument("--ori_weight_gens", type=int, default=500, help="generations for the orientation weight ramp")
+parser.add_argument("--calm_weight_start", type=float, default=None,
+                    help="survival signal: smoothness, body rate and downwash weights start at this value and fade "
+                         "linearly to --calm_weight (default 0.5 if not given) over --calm_fade_gens generations")
+parser.add_argument("--calm_fade_gens", type=int, default=300, help="generations of that fade")
+parser.add_argument("--force_weight", type=float, default=None,
+                    help="force (thrust effort) penalty weight, set separately from the other calm terms (constant)")
 parser.add_argument("--calm_weight", type=float, default=None,
                     help="weight of each calm-flight term (smoothness, body rate, force, downwash; env: 0.5)")
 parser.add_argument("--collision_off_gens", type=int, default=0,
@@ -264,8 +274,16 @@ class Curriculum:
         if args.calm_weight is not None:
             for k in CALM_TERMS:
                 setattr(u.cfg, k, args.calm_weight)
+        if args.force_weight is not None:
+            u.cfg.force_penalty_weight = args.force_weight
+        # fade of the 3 non-force calm terms: calm_weight_start -> calm_weight (env 0.5 if not given)
+        self.calm_fade = None
+        if args.calm_weight_start is not None:
+            end = args.calm_weight if args.calm_weight is not None else 0.5
+            self.calm_fade = (args.calm_weight_start, end)
         self.active = any([args.curr_yaw_gens, args.curr_tilt_gens, args.curr_height_gens,
-                           self.weights_changed, args.calm_weight is not None, args.collision_off_gens])
+                           self.weights_changed, args.calm_weight is not None, args.collision_off_gens,
+                           args.calm_weight_start is not None, args.force_weight is not None])
 
     @staticmethod
     def _sym(full, half):
@@ -299,7 +317,13 @@ class Curriculum:
         u.cfg.ori_track_weight = float(ramp(gen, 0, a.ori_weight_gens, *self.ori_w))
         s["pos_weight_now"] = float(u.cfg.pos_track_weight)
         s["ori_weight_now"] = float(u.cfg.ori_track_weight)
+        if self.calm_fade is not None:
+            w = float(ramp(gen, 0, a.calm_fade_gens, *self.calm_fade))
+            for k in CALM_TERMS:
+                if k != "force_penalty_weight" or a.force_weight is None:
+                    setattr(u.cfg, k, w)
         s["calm_weight_now"] = float(getattr(u.cfg, CALM_TERMS[0]))
+        s["force_weight_now"] = float(u.cfg.force_penalty_weight)
         # drone collision
         if a.collision_off_gens:
             u.cfg.drone_collision_threshold = float(ramp(gen, a.collision_off_gens, a.collision_ramp_gens, 0.0, f["coll"]))
@@ -336,7 +360,7 @@ def start_errors(obs0):
 
 
 CURR_FIELDS = ["curr_heading_change_max_deg", "curr_tilt_max_deg", "curr_z_half_range",
-               "pos_weight_now", "ori_weight_now", "calm_weight_now", "collision_dist_now", "fitness_max_per_drone",
+               "pos_weight_now", "ori_weight_now", "calm_weight_now", "force_weight_now", "collision_dist_now", "fitness_max_per_drone",
                # rotors (alive swarms): share of rotor-time at the thrust limit, mean thrust / limit over all
                # rotors, and the same for the most loaded drone of each swarm
                "rotor_sat_frac", "rotor_thrust_frac", "rotor_thrust_frac_max_drone",
@@ -424,7 +448,8 @@ def main():
               f"tilt {args_cli.curr_tilt_gens} gens, height {args_cli.curr_height_gens} gens (from +-{args_cli.curr_z0} m), "
               f"pos weight {curr.pos_w[0]} -> {curr.pos_w[1]} over {args_cli.pos_weight_gens} gens, "
               f"ori weight {curr.ori_w[0]} -> {curr.ori_w[1]} over {args_cli.ori_weight_gens} gens, "
-              f"calm weight {args_cli.calm_weight}, collision off {args_cli.collision_off_gens} gens "
+              f"calm weight {args_cli.calm_weight} (fade from {args_cli.calm_weight_start} over {args_cli.calm_fade_gens} gens), "
+              f"force weight {args_cli.force_weight}, collision off {args_cli.collision_off_gens} gens "
               f"(+{args_cli.collision_ramp_gens} ramp)", flush=True)
 
     log_path = f"./logs/generation_log_{run_id}.csv"
@@ -609,7 +634,7 @@ def main():
         if curr.active:
             print(f"    task: heading change <= {curr_now['curr_heading_change_max_deg']:.0f} deg, "
                   f"tilt <= {curr_now['curr_tilt_max_deg']:.0f} deg, z +-{curr_now['curr_z_half_range']:.2f} m, "
-                  f"pos w {curr_now['pos_weight_now']:.2f}, ori w {curr_now['ori_weight_now']:.2f}, calm w {curr_now['calm_weight_now']:.2f}, "
+                  f"pos w {curr_now['pos_weight_now']:.2f}, ori w {curr_now['ori_weight_now']:.2f}, calm w {curr_now['calm_weight_now']:.2f}, force w {curr_now['force_weight_now']:.2f}, "
                   f"collision {curr_now['collision_dist_now']:.2f} m | asked at start: "
                   f"{curr_now['start_pos_err_mean']:.2f} m, {curr_now['start_att_err_deg_mean']:.0f} deg "
                   f"(90%: {curr_now['start_att_err_deg_p90']:.0f}) | max fitness {curr_now['fitness_max_per_drone']:.1f}",

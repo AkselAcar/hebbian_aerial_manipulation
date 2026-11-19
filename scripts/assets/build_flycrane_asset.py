@@ -5,6 +5,8 @@ optionally convert it to USD with Isaac Lab 3.0's converter.
 Starts from Jack's URDF (assets/data/AMR/flycrane_rod_data/flycrane.urdf, the source of the
 flycrane_rod.usd the hover task loads) and keeps the payload, the cables and the joint tree as they are.
 It changes only:
+  * every link without <inertial> gets a tiny explicit mass (1e-4 kg): the Isaac Lab 3.0 converter would
+    give it ~1 kg (found 2026-11-18: Jack's Falcon<i>/base_link, the drones flew 1 kg too heavy).
   * names: "/" -> "_" in every link / joint name. The Isaac Lab 3.0 URDF importer would otherwise encode
     "Falcon1/base_link" into something like "tn__Falcon1base_link_VP" and the env's regexes
     ("Falcon.*_base_link_inertia", "Falcon.*_rotor_.*", ...) would find nothing. The old USD already
@@ -182,6 +184,8 @@ def summary(root, drone):
     j = find(root, "joint", "Falcon1_base_joint").find("origin").get("xyz")
     r = [find(root, "joint", f"Falcon1_rotor_{k}_joint").find("origin").get("xyz") for k in range(4)]
     print(f"[flycrane] CoM above the cable attachment: {j} | rotor hubs (rel. attachment): {r}")
+    missing = [l.get("name") for l in root.findall("link") if l.find("inertial") is None]
+    assert not missing, f"links without <inertial> (the converter would give them ~1 kg): {missing}"
     names = [el.get("name") for el in root.iter() if el.tag in ("link", "joint")]
     assert not any("/" in n for n in names), "a name still contains '/'"
 
@@ -198,6 +202,13 @@ def main():
     tree = ET.parse(SRC_URDF)
     root = tree.getroot()
     rename_all(root)
+    # Links without <inertial> (Jack's Falcon<i>/base_link, the cable attachment point): the Isaac Lab 3.0
+    # converter gives them a default mass of ~1 kg (his old converter: 0), which overloads the drones.
+    # Give every such link the same tiny explicit mass as in the OmniNxt model.
+    for link in root.findall("link"):
+        if link.find("inertial") is None:
+            set_inertial(link, SMALL_MASS, (SMALL_INERTIA,) * 3)
+            print(f"[flycrane] {link.get('name')}: no <inertial> in the source, set to {SMALL_MASS} kg")
     if a.drone != "falcon":
         apply_drone(root, load_params(a.drone))
     if a.no_meshes:
