@@ -8,14 +8,15 @@ Each generation:
      the reps of a genome are averaged;
   4. the fitnesses go back to the optimizer, which makes the next population.
 
-Genome (--genome): w_abcd = [start weights | A | B | C | D], 5 x 1139 = 5695 values;
-                   w      = start weights only, a static network without plasticity (1139).
+Genome (--genome): w_abcd = [start weights | A | B | C | D], 5 x n values (n = 1139 synapses for the
+                   default 17-17 network, 750 for --hidden 15); w = start weights only, a static network.
 Fitness scale: per drone, a perfect 2000-step episode gives (sum of the reward weights) x 0.01 s x 2000,
 i.e. 100 with the default weights (6 terms summing to 5); the logs also give it as fitness_max_per_drone.
 
 Options, grouped (all off / at the env's values unless given):
   optimizer       --optimizer, --pop_size, --n_reps, --sigma0, --es_lr, --es_optimizer, --weight_decay,
                   --lr_schedule cosine (with --lr_total_gens, --lr_min_frac), --init_from (warm start)
+  network         --hidden (layer sizes, default 17 17), --obs_norm fixed|z with --zstats (input scaling)
   plasticity      --lr (Hebbian learning rate), --hebb_decay (pull back to the start weights, 1/s),
                   --hebb_gate / --hebb_gate_att / --hebb_gate_mode (scale the update by the position
                   and/or attitude error)
@@ -53,6 +54,12 @@ parser.add_argument("--es_optimizer", choices=["adam", "sgd"], default="adam",
                     help="OpenAI-ES only: adam (Salimans et al.) or sgd = plain gradient step (Najarro & Risi)")
 parser.add_argument("--weight_decay", type=float, default=0.005, help="OpenAI-ES only: L2 penalty on the genome")
 parser.add_argument("--lr", type=float, default=0.001, help="Hebbian learning rate (paper: 0.1)")
+parser.add_argument("--hidden", type=int, nargs="+", default=[17, 17],
+                    help="hidden layer sizes, e.g. --hidden 15 for one layer of 15 (default: 17 17)")
+parser.add_argument("--obs_norm", choices=["fixed", "z"], default="fixed",
+                    help="input scaling: fixed bounds (default) or z-normalisation with the statistics of --zstats")
+parser.add_argument("--zstats", type=str, default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "zstats.json"),
+                    help="json file with the per-input mean and std used by --obs_norm z")
 parser.add_argument("--mass_range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
                     help="payload mass range in kg, new mass every reset (default: fixed 1.4 kg)")
 parser.add_argument("--init_from", type=str, default=None,
@@ -334,7 +341,8 @@ CURR_FIELDS = ["curr_heading_change_max_deg", "curr_tilt_max_deg", "curr_z_half_
 
 
 def main():
-    n_input, n_hidden, n_output = 45, 17, 5
+    n_input, n_output = 45, 5
+    hidden = tuple(args_cli.hidden)
 
     pop = args_cli.pop_size
     n_reps = args_cli.n_reps
@@ -365,7 +373,8 @@ def main():
     print(f"env max_episode_length={u.max_episode_length}, your episode_steps={T}")
     print("=============", flush=True)
 
-    n_synapses = n_hidden * n_input + n_hidden * n_hidden + n_output * n_hidden  # 1139
+    sizes = (n_input,) + hidden + (n_output,)
+    n_synapses = sum(sizes[i] * sizes[i + 1] for i in range(len(sizes) - 1))  # 1139 for 17-17, 750 for 15
     D = 5 * n_synapses if args_cli.genome == "w_abcd" else n_synapses             # 5695 or 1139
     x0 = np.zeros(D)  # outputs start at 0 = hold position
     if args_cli.init_from:
@@ -396,8 +405,18 @@ def main():
     print(f"payload mass: {'random ' + str(args_cli.mass_range) + ' kg, new every reset' if args_cli.mass_range else 'fixed (env default 1.4 kg)'}",
           flush=True)
 
-    brains = BatchedHebbian(n_input, n_hidden, n_output, lr=args_cli.lr, device=device,
-                            decay=args_cli.hebb_decay * u.step_dt)       # per-second rate -> per step
+    obs_mean = obs_std = None
+    if args_cli.obs_norm == "z":
+        with open(args_cli.zstats) as f:
+            zs = json.load(f)
+        obs_mean, obs_std = zs["mean"], zs["std"]
+        with open(os.path.join(results_dir, "zstats.json"), "w") as f:   # kept with the run, read by the replay
+            json.dump(zs, f, indent=1)
+    brains = BatchedHebbian(n_states=n_input, n_actions=n_output, lr=args_cli.lr, device=device,
+                            decay=args_cli.hebb_decay * u.step_dt,       # per-second rate -> per step
+                            hidden=hidden, obs_mean=obs_mean, obs_std=obs_std)
+    print(f"network {' -> '.join(map(str, sizes))} ({n_synapses} synapses, genome {D}), "
+          f"inputs: {'z-normalised (' + args_cli.zstats + ')' if obs_mean is not None else 'fixed bounds'}", flush=True)
     print(f"lr schedule {args_cli.lr_schedule} (total {args_cli.lr_total_gens} gens, min {args_cli.lr_min_frac} x es_lr) | "
           f"plasticity brakes: decay {args_cli.hebb_decay}/s, gate {args_cli.hebb_gate} m, "
           f"{args_cli.hebb_gate_att} deg ({args_cli.hebb_gate_mode})", flush=True)

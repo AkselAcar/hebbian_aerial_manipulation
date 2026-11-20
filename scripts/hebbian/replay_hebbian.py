@@ -154,7 +154,7 @@ class WeightRecorder:
             return
         ids = self.ids()
         W1, W2, Wo = (W[ids] for W in self.prev)
-        s = obs_all[ids].to(W1.dtype) / self.b.state_div
+        s = self.b.scale(obs_all[ids])
         x1 = torch.tanh(torch.bmm(W1, s.unsqueeze(-1))).squeeze(-1)
         x2 = torch.tanh(torch.bmm(W2, x1.unsqueeze(-1))).squeeze(-1)
         out = torch.tanh(torch.bmm(Wo, x2.unsqueeze(-1))).squeeze(-1)
@@ -337,7 +337,19 @@ def main():
         print(f"WARNING: trained with Hebbian lr {targs.get('lr')}, replaying with {args_cli.lr}", flush=True)
     print(f"plasticity brakes: decay {hebb_decay}/s, gate {hebb_gate} m, {hebb_gate_att} deg ({hebb_gate_mode})",
           flush=True)
-    brains = BatchedHebbian(lr=args_cli.lr, device=device, decay=hebb_decay * u.step_dt)
+    # network shape and input scaling as in training (older runs: 17-17, fixed bounds)
+    hidden = tuple(targs.get("hidden", [17, 17]))
+    obs_mean = obs_std = None
+    if targs.get("obs_norm", "fixed") == "z":
+        with open(os.path.join(args_cli.results_dir, "zstats.json")) as f:
+            zs = json.load(f)
+        obs_mean, obs_std = zs["mean"], zs["std"]
+    brains = BatchedHebbian(lr=args_cli.lr, device=device, decay=hebb_decay * u.step_dt,
+                            hidden=hidden, obs_mean=obs_mean, obs_std=obs_std)
+    print(f"network hidden layers {hidden}, inputs {'z-normalised' if obs_mean is not None else 'fixed bounds'}",
+          flush=True)
+    if args_cli.record_weights and brains.W2 is None:
+        raise SystemExit("--record_weights only supports the network with 2 hidden layers")
     stamp = time.strftime("%Y%m%d_%H%M%S")
     label = args_cli.which if args_cli.which == "theta" or args_cli.best_gen == -1 else f"best_gen{args_cli.best_gen}"
     if args_cli.payload_mass is not None:
