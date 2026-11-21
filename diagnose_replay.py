@@ -2,7 +2,9 @@
 """Diagnostics of trained controllers from replay folders  (plain python3 + matplotlib).
 
     python3 diagnose_replay.py --replay <folder> [<folder> ...] --out diag
-        -> table of key numbers for every folder (printed + diag/diag_table.csv), e.g. to compare
+        -> table of key numbers for every folder (printed + diag/diag_table.csv), starting with the
+           evaluation score and success rate (eval_metrics: same for every setup, crashes included;
+           the other columns use the flights that never crashed), e.g. to compare
            a normal replay with --freeze_after 5 and --zero_id replays of the same controller
         -> for the FIRST folder:
            diag_orientation.png / .csv   attitude error split into tilt and yaw over time, and
@@ -78,6 +80,25 @@ def at(f, t_s):
     return k
 
 
+def eval_metrics(fl):
+    """Evaluation of a controller that does not depend on how it was trained (all flights, crashes included).
+
+    score:        mean over flights and over the WHOLE episode of 0.5 * (exp(-1.5 * pos_err) + exp(-1.5 * att_err)),
+                  the env's tracking reward shape with fixed equal weights, 0 after a crash; x 100.
+                  100 = payload exactly on its goal for 20 s; staying alive far from the goal gives some points.
+    success_pct:  flights that never crashed AND end within 0.3 m and 0.4 rad (the env's goal_achieved ranges).
+    survival_pct: flights that never crashed.
+    """
+    s = []
+    for f in fl:
+        pe = np.linalg.norm(f["pos"], axis=1)
+        ae = np.radians(f["att"])
+        s.append(np.sum(0.5 * (np.exp(-1.5 * pe) + np.exp(-1.5 * ae))) / f["T"])
+    succ = [f["full"] and np.linalg.norm(f["pos"][-1]) < 0.3 and np.radians(f["att"][-1]) < 0.4 for f in fl]
+    return dict(score=100 * float(np.mean(s)), success_pct=100 * float(np.mean(succ)),
+                survival_pct=100 * float(np.mean([f["full"] for f in fl])))
+
+
 def table_row(name, fl):
     """One line of the table. att_gain = attitude error at the start minus at the end, per flight
     (positive = the controller turned the payload towards its goal); _over10deg_% = share of flights
@@ -92,14 +113,15 @@ def table_row(name, fl):
     p5, p10 = [np.median([np.linalg.norm(f["pos"][at(f, s)]) for f in full]) for s in (5, 10)]
     bias = np.mean([f["pos"][-1] for f in full], 0)
     a0 = np.array([f["att"][0] for f in full])                     # attitude error asked at the start
-    return [name, len(fl), f"{100 * len(full) / len(fl):.0f}", f"{pe.mean():.2f}", f"{np.median(pe):.2f}",
+    m = eval_metrics(fl)
+    return [name, len(fl), f"{m['score']:.1f}", f"{m['success_pct']:.0f}", f"{100 * len(full) / len(fl):.0f}", f"{pe.mean():.2f}", f"{np.median(pe):.2f}",
             f"{100 * np.mean(pe < 0.3):.0f}", f"{rmse_p:.2f}", f"{ae.mean():.0f}", f"{np.median(ae):.0f}",
             f"{np.median(tl):.0f}", f"{np.median(yw):.0f}", f"{rmse_a:.0f}",
             f"{np.median(a0):.0f}", f"{np.median(a0 - ae):+.0f}", f"{100 * np.mean(a0 - ae > 10):.0f}",
             f"{p5:.2f}", f"{p10:.2f}", f"{np.median(pe):.2f}", *(f"{b:+.2f}" for b in bias)]
 
 
-HEAD = ["replay", "flights", "full_%", "pos_end_mean_m", "pos_end_median_m", "within_0.3m_%", "pos_RMSE_m",
+HEAD = ["replay", "flights", "eval_score", "success_%", "full_%", "pos_end_mean_m", "pos_end_median_m", "within_0.3m_%", "pos_RMSE_m",
         "att_end_mean_deg", "att_end_median_deg", "tilt_end_median_deg", "yaw_end_median_deg", "att_RMSE_deg",
         "att_start_median_deg", "att_gain_median_deg", "att_gain_over10deg_%",
         "pos_median_5s_m", "pos_median_10s_m", "pos_median_20s_m", "bias_x_m", "bias_y_m", "bias_z_m"]

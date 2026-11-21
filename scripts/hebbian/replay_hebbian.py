@@ -24,6 +24,12 @@ Typical use (inside the container, see the jobs in jobs/, e.g. review_replays.sh
   replay_hebbian.py --results_dir results/<run> --num_envs 1 --n_episodes 6 --video --viz newton
   # hover test: every drone gets action 0, the network is not used
   replay_hebbian.py --headless --results_dir results/<run> --zero_action --num_envs 32
+  # hold test: the goal is the start pose, can the controller stay there?
+  replay_hebbian.py --headless --results_dir results/<run> --goal_at_start --num_envs 32
+  # low-level check without the network: scripted commands (see --test_signal), then check_tracking.py
+  replay_hebbian.py --headless --results_dir results/<run> --test_signal step_z --num_envs 8
+  # a controller from earlier in training (theta_hist/, saved every 25 gens since Nov 21)
+  replay_hebbian.py --headless --results_dir results/<run> --gen 100 --num_envs 64
 
 Output: <results_dir>/replay_<which>_<timestamp>/
   ep<k>.npz                        trajectories of episode k (all envs)
@@ -50,6 +56,16 @@ parser.add_argument("--which", choices=["theta", "best"], default="theta",
 parser.add_argument("--best_gen", type=int, default=-1,
                     help="with --which best: generation row of x_best.npy to replay (default: last). "
                          "x_best holds the best-so-far sample at every generation.")
+parser.add_argument("--gen", type=int, default=-1,
+                    help="with --which theta: replay results/<run>/theta_hist/theta_gen<gen>.npy (the search centre "
+                         "at that generation); with --which best: same as --best_gen")
+parser.add_argument("--goal_at_start", action="store_true",
+                    help="hold test: after the reset the goal is set to the payload's start pose (zero error)")
+parser.add_argument("--test_signal", choices=["none", "step_z", "sine_x", "rate_p", "pd"], default="none",
+                    help="replace the network's commands (same for the 3 drones): step_z = +1 then -1 m/s^2 up "
+                         "(t 1-2 s, 2-3 s); sine_x = 1 m/s^2 sine at 0.5 Hz in x from t 1 s; rate_p = roll rate "
+                         "+0.5 then -0.5 rad/s (t 1-1.5 s, 1.5-2 s); pd = acc = 2 * payload goal error - 2 * drone "
+                         "velocity (a hand-made position controller using the same inputs as the network)")
 parser.add_argument("--num_envs", type=int, default=16, help="swarms run in parallel per episode")
 parser.add_argument("--n_episodes", type=int, default=1, help="episodes run one after the other")
 parser.add_argument("--episode_steps", type=int, default=2000)
@@ -108,7 +124,7 @@ _spec = importlib.util.spec_from_file_location("batched_hebbian", _bh_path)
 _bh = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_bh)
 BatchedHebbian = _bh.BatchedHebbian
-from isaaclab.utils.math import matrix_from_quat, quat_error_magnitude
+from isaaclab.utils.math import matrix_from_quat, quat_apply, quat_error_magnitude, quat_inv
 
 import MARL_mav_carry_ext.tasks  # noqa: F401
 from MARL_mav_carry_ext.tasks.directMARL.hover.marl_hover_env_cfg import MARLHoverEnvCfg
@@ -225,9 +241,26 @@ def payload_masses(u, body="load_link"):
     return None
 
 
-def load_genome(results_dir, which, best_gen=-1):
+def test_signal_actions(kind, t, obs):
+    """Scripted commands for all drones (obs: (n_brains, 45)), in the env's action units."""
+    a = torch.zeros(obs.shape[0], 5, device=obs.device, dtype=torch.float32)
+    if kind == "step_z":
+        a[:, 2] = 1.0 if 1.0 <= t < 2.0 else (-1.0 if 2.0 <= t < 3.0 else 0.0)
+    elif kind == "sine_x":
+        a[:, 0] = float(np.sin(2 * np.pi * 0.5 * (t - 1.0))) if t >= 1.0 else 0.0
+    elif kind == "rate_p":
+        a[:, 3] = 0.5 if 1.0 <= t < 1.5 else (-0.5 if 1.5 <= t < 2.0 else 0.0)
+    elif kind == "pd":
+        # inputs 33:36 = payload goal position error (goal - payload), 27:30 = drone linear velocity
+        a[:, :3] = (2.0 * obs[:, 33:36] - 2.0 * obs[:, 27:30]).clamp(-5.0, 5.0)
+    return a
+
+
+def load_genome(results_dir, which, best_gen=-1, gen=-1):
     if which == "theta":
         path = os.path.join(results_dir, "theta.npy")
+        if gen >= 0:
+            path = os.path.join(results_dir, "theta_hist", f"theta_gen{gen:04d}.npy")
         g = np.load(path)
     else:
         path = os.path.join(results_dir, "x_best.npy")
@@ -266,7 +299,9 @@ def open_writer(path, fps):
 
 
 def main():
-    genome = load_genome(args_cli.results_dir, args_cli.which, args_cli.best_gen)
+    if args_cli.which == "best" and args_cli.gen >= 0:
+        args_cli.best_gen = args_cli.gen
+    genome = load_genome(args_cli.results_dir, args_cli.which, args_cli.best_gen, args_cli.gen)
     n_envs, T = args_cli.num_envs, args_cli.episode_steps
 
     env_cfg = MARLHoverEnvCfg()
@@ -348,10 +383,20 @@ def main():
                             hidden=hidden, obs_mean=obs_mean, obs_std=obs_std)
     print(f"network hidden layers {hidden}, inputs {'z-normalised' if obs_mean is not None else 'fixed bounds'}",
           flush=True)
+    fw = os.path.join(args_cli.results_dir, "fixed_weights.npy")
+    if genome.size == 4 * brains.n_syn and os.path.isfile(fw):       # --from_mappo run: only A, B, C, D evolved
+        genome = np.concatenate([np.load(fw).astype(np.float64).reshape(-1), genome])
+        print(f"start weights from {fw} (fixed during training)", flush=True)
     if args_cli.record_weights and brains.W2 is None:
         raise SystemExit("--record_weights only supports the network with 2 hidden layers")
     stamp = time.strftime("%Y%m%d_%H%M%S")
     label = args_cli.which if args_cli.which == "theta" or args_cli.best_gen == -1 else f"best_gen{args_cli.best_gen}"
+    if args_cli.which == "theta" and args_cli.gen >= 0:
+        label = f"theta_gen{args_cli.gen:04d}"
+    if args_cli.goal_at_start:
+        label += "_goalatstart"
+    if args_cli.test_signal != "none":
+        label = f"signal_{args_cli.test_signal}"        # the genome is not used
     if args_cli.payload_mass is not None:
         label += f"_m{args_cli.payload_mass:g}"
     if args_cli.lr != 0.001:
@@ -378,6 +423,14 @@ def main():
             torch.manual_seed(args_cli.seed + ep)
             np.random.seed(args_cli.seed + ep)
         obs, _ = env.reset()
+        if args_cli.goal_at_start:              # goal = the payload's start pose, then fresh observations
+            st = u.robot.data.body_com_state_w
+            st = getattr(st, "torch", st)[:, u._payload_idx].reshape(u.num_envs, -1)
+            u.pose_command_w[:, :3] = st[:, :3] - u.scene.env_origins
+            u.pose_command_w[:, 3:7] = st[:, 3:7]
+            obs = u._get_observations()
+            print(f"goal at start: initial position error {u.goal_pos_error.norm(dim=-1).max():.4f} m (max over envs)",
+                  flush=True)
         rew_names = list(u._episode_sums.keys())
         rew_rec = []
         alive = torch.ones(n_envs, dtype=torch.bool, device=device)
@@ -385,7 +438,8 @@ def main():
         first_crash = np.full(n_envs, T)
         reasons = np.zeros((n_envs, len(CRASH_REASONS)), dtype=bool)
         rec = {k: [] for k in ["drones", "load", "goal", "actions", "alive",
-                               "att_err", "load_R", "goal_R", "load_linvel", "load_angvel"]}
+                               "att_err", "load_R", "goal_R", "load_linvel", "load_angvel",
+                               "acc_meas", "rate_meas", "drone_quat"]}
         wrec = WeightRecorder(brains, args_cli.record_env, args_cli.record_every) if args_cli.record_weights else None
         frames, writer = [], None
         if args_cli.video:
@@ -405,6 +459,8 @@ def main():
             acts = brains.act(obs_all, update_mask=mask, gate=gate) * mask.unsqueeze(1)
             if args_cli.zero_action:
                 acts = torch.zeros_like(acts)
+            if args_cli.test_signal != "none":
+                acts = test_signal_actions(args_cli.test_signal, t * u.step_dt, obs_all) * mask.unsqueeze(1)
             if wrec:
                 wrec.after(mask)
             acts = acts.view(n_agents, n_envs, -1)
@@ -424,6 +480,13 @@ def main():
             rec["alive"].append(alive_before.cpu().numpy())
             for k in ["att_err", "load_R", "goal_R", "load_linvel", "load_angvel"]:
                 rec[k].append(snap[k].float().cpu().numpy())
+            # what the drones actually did, to compare with the commands (check_tracking.py):
+            # linear acceleration in the world frame (no gravity, like the command) and body rates
+            q = u.drone_orientations.reshape(-1, 4)
+            rate_b = quat_apply(quat_inv(q), u.drone_angular_velocities.reshape(-1, 3)).view(n_envs, n_agents, 3)
+            rec["acc_meas"].append(u.drone_linear_accelerations.float().cpu().numpy())
+            rec["rate_meas"].append(rate_b.float().cpu().numpy())
+            rec["drone_quat"].append(u.drone_orientations.float().cpu().numpy())
 
             crashed = terminated[agents[0]].reshape(-1).bool()
             timed_out = truncated[agents[0]].reshape(-1).bool()
@@ -458,6 +521,9 @@ def main():
                             att_err=np.stack(rec["att_err"]), load_R=np.stack(rec["load_R"]),
                             goal_R=np.stack(rec["goal_R"]), load_linvel=np.stack(rec["load_linvel"]),
                             load_angvel=np.stack(rec["load_angvel"]),
+                            acc_meas=np.stack(rec["acc_meas"]), rate_meas=np.stack(rec["rate_meas"]),
+                            drone_quat=np.stack(rec["drone_quat"]),          # (T, n_envs, 3 drones, 3 or 4)
+                            goal_at_start=args_cli.goal_at_start, test_signal=args_cli.test_signal,
                             reason_names=np.array(CRASH_REASONS), step_dt=u.step_dt, payload_mass=mass,
                             hebbian_lr=args_cli.lr, hebb_decay=hebb_decay, hebb_gate=hebb_gate,
                             hebb_gate_att=hebb_gate_att, seed=args_cli.seed, hebb_gate_mode=hebb_gate_mode, zero_action=args_cli.zero_action,

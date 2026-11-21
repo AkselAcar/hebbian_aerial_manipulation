@@ -10,6 +10,8 @@ Each generation:
 
 Genome (--genome): w_abcd = [start weights | A | B | C | D], 5 x n values (n = 1139 synapses for the
                    default 17-17 network, 750 for --hidden 15); w = start weights only, a static network.
+                   --from_mappo <folder>: start weights fixed to a MAPPO policy (export_mappo_to_hebbian.py),
+                   only [A | B | C | D] evolve (4 x n), inputs z-normalised with MAPPO's frozen statistics.
 Fitness scale: per drone, a perfect 2000-step episode gives (sum of the reward weights) x 0.01 s x 2000,
 i.e. 100 with the default weights (6 terms summing to 5); the logs also give it as fitness_max_per_drone.
 
@@ -26,7 +28,8 @@ Options, grouped (all off / at the env's values unless given):
                   with --calm_fade_gens, --force_weight
 
 Outputs: logs/generation_log_<run>.csv (one row per generation), and results/<run>/ with the optimizer
-state (theta.npy = the OpenAI-ES centre, the controller we evaluate; x_best.npy) and train_args.json.
+state (theta.npy = the OpenAI-ES centre, the controller we evaluate; x_best.npy), train_args.json and
+theta_hist/theta_gen<N>.npy (the centre every --save_theta_every generations, for replays along training).
 
 """
 
@@ -62,6 +65,13 @@ parser.add_argument("--zstats", type=str, default=os.path.join(os.path.dirname(o
                     help="json file with the per-input mean and std used by --obs_norm z")
 parser.add_argument("--mass_range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
                     help="payload mass range in kg, new mass every reset (default: fixed 1.4 kg)")
+parser.add_argument("--save_theta_every", type=int, default=25,
+                    help="OpenAI-ES: save the search centre every N generations in results/<run>/theta_hist/ "
+                         "(replay one with replay_hebbian.py --gen N; 0 = off)")
+parser.add_argument("--from_mappo", type=str, default=None,
+                    help="folder written by scripts/skrl/export_mappo_to_hebbian.py: its weights become the fixed "
+                         "start weights, only A, B, C, D evolve (genome 4 x n, zeros = the MAPPO policy itself); "
+                         "sets --hidden, --obs_norm z and --zstats from that folder")
 parser.add_argument("--init_from", type=str, default=None,
                     help="start genome, e.g. results/<run>/theta.npy (default: zeros)")
 parser.add_argument("--lr_schedule", choices=["const", "cosine"], default="const",
@@ -342,6 +352,21 @@ CURR_FIELDS = ["curr_heading_change_max_deg", "curr_tilt_max_deg", "curr_z_half_
 
 def main():
     n_input, n_output = 45, 5
+    fixed_w = None                           # start weights that are not evolved (--from_mappo)
+    if args_cli.from_mappo:
+        with open(os.path.join(args_cli.from_mappo, "train_args.json")) as f:
+            m_args = json.load(f)
+        fixed_w = np.load(os.path.join(args_cli.from_mappo, "fixed_weights.npy")).astype(float).reshape(-1)
+        if list(args_cli.hidden) != list(m_args["hidden"]):
+            print(f"--from_mappo: hidden layers {args_cli.hidden} -> {m_args['hidden']} (the MAPPO network)", flush=True)
+        args_cli.hidden = list(m_args["hidden"])
+        args_cli.obs_norm = "z"
+        args_cli.zstats = os.path.join(args_cli.from_mappo, "zstats.json")   # frozen MAPPO statistics
+        args_cli.genome = "abcd"
+        if args_cli.drone is None:
+            args_cli.drone = m_args.get("drone")
+        elif args_cli.drone != m_args.get("drone"):
+            print(f"WARNING: MAPPO was trained on {m_args.get('drone')}, running on {args_cli.drone}", flush=True)
     hidden = tuple(args_cli.hidden)
 
     pop = args_cli.pop_size
@@ -375,7 +400,9 @@ def main():
 
     sizes = (n_input,) + hidden + (n_output,)
     n_synapses = sum(sizes[i] * sizes[i + 1] for i in range(len(sizes) - 1))  # 1139 for 17-17, 750 for 15
-    D = 5 * n_synapses if args_cli.genome == "w_abcd" else n_synapses             # 5695 or 1139
+    D = {"w_abcd": 5, "abcd": 4, "w": 1}[args_cli.genome] * n_synapses           # 5695 / 4556 / 1139 for 17-17
+    if fixed_w is not None and fixed_w.size != n_synapses:
+        raise ValueError(f"--from_mappo has {fixed_w.size} weights, the network needs {n_synapses}")
     x0 = np.zeros(D)  # outputs start at 0 = hold position
     if args_cli.init_from:
         x0 = np.load(args_cli.init_from).astype(float).reshape(-1)
@@ -412,6 +439,10 @@ def main():
         obs_mean, obs_std = zs["mean"], zs["std"]
         with open(os.path.join(results_dir, "zstats.json"), "w") as f:   # kept with the run, read by the replay
             json.dump(zs, f, indent=1)
+    if fixed_w is not None:
+        np.save(os.path.join(results_dir, "fixed_weights.npy"), fixed_w)    # read by the replay
+        print(f"start weights fixed from {args_cli.from_mappo} (mean |w| {np.abs(fixed_w).mean():.3f}); "
+              f"evolving A, B, C, D only", flush=True)
     brains = BatchedHebbian(n_states=n_input, n_actions=n_output, lr=args_cli.lr, device=device,
                             decay=args_cli.hebb_decay * u.step_dt,       # per-second rate -> per step
                             hidden=hidden, obs_mean=obs_mean, obs_std=obs_std)
@@ -457,11 +488,18 @@ def main():
 
     for gen in range(args_cli.n_generations):
         gen_start_t = time.time()
+        k = args_cli.save_theta_every
+        if k and hasattr(learner, "theta") and (gen % k == 0 or gen == args_cli.n_generations - 1):
+            os.makedirs(os.path.join(results_dir, "theta_hist"), exist_ok=True)   # centre that generates this gen
+            np.save(os.path.join(results_dir, "theta_hist", f"theta_gen{gen:04d}.npy"), learner.theta)
 
         # --- one brain per (drone, env), all built from the population at once --
         # Env j runs genome j % pop: its 3 drones and its reps start from the same
         # evolved weights and rules, but their Hebbian updates are independent.
-        brains.load(learner.x_new, n_envs, n_agents)
+        genomes = learner.x_new
+        if fixed_w is not None:                                      # [MAPPO weights | evolved A, B, C, D]
+            genomes = np.concatenate([np.broadcast_to(fixed_w, (genomes.shape[0], n_synapses)), genomes], 1)
+        brains.load(genomes, n_envs, n_agents)
         w_abs_start = brains.mean_abs_w1(agent=0)
 
         curr_now = curr.apply(gen)       # set this generation's task and reward weights (no-op when all off)

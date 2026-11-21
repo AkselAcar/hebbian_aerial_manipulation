@@ -1,0 +1,84 @@
+seed: 42
+
+# MAPPO baseline with the same policy network as the Hebbian controller, so that its weights can be
+# used as the start weights of a Hebbian (A, B, C, D) run (scripts/skrl/export_mappo_to_hebbian.py).
+#
+# Policy = BatchedHebbian with A = B = C = D = 0:
+#   s = clip((obs - mean) / std, -5, 5)      observation_preprocessor (RunningStandardScaler, clip 5)
+#   action_mean = [5, 5, 5, 2, 2] * tanh(Wo tanh(W1 s))      no biases, tanh everywhere
+# with 45 inputs (history_len 1) and one hidden layer of 15 (set by --hidden in train_mappo_hebbnet.py).
+# The critic, the memory and the PPO settings are the same as in skrl_mappo_cfg.yaml.
+models:
+  separate: True
+  shared_across_agents: True  # one policy for the 3 drones, like the one genome per swarm
+  policy:
+    class: GaussianMixin
+    clip_actions: False
+    clip_log_std: True
+    min_log_std: -20.0
+    max_log_std: 2.0
+    initial_log_std: 0.0
+    network:
+      - name: net
+        input: OBSERVATIONS
+        layers:
+          - linear: {out_features: 15, bias: False}
+          - linear: {out_features: 5, bias: False}
+        activations: [tanh, tanh]
+    output: "torch.tensor([5.0, 5.0, 5.0, 2.0, 2.0], device=self.device) * net"
+  value:
+    class: DeterministicMixin
+    clip_actions: False
+    network:
+      - name: net
+        input: STATES
+        layers: [1024, 512, 256, 128]
+        activations: elu
+    output: ONE
+
+
+memory:
+  class: RandomMemory
+  memory_size: -1
+
+
+agent:
+  class: MAPPO
+  rollouts: 128
+  learning_epochs: 5
+  mini_batches: 4
+  discount_factor: 0.99
+  gae_lambda: 0.95
+  # (policy, value); the policy lr is set by --policy_lr in train_mappo_hebbnet.py
+  learning_rate: [5.0e-05, 1.0e-04]
+  separate_optimizers: True
+  learning_rate_scheduler: null
+  learning_rate_scheduler_kwargs: null
+  observation_preprocessor: RunningStandardScaler   # becomes the frozen z-statistics of the Hebbian run
+  observation_preprocessor_kwargs: null
+  state_preprocessor: RunningStandardScaler
+  state_preprocessor_kwargs: null
+  value_preprocessor: RunningStandardScaler
+  value_preprocessor_kwargs: null
+  random_timesteps: 0
+  learning_starts: 0
+  grad_norm_clip: 1.0
+  ratio_clip: 0.1
+  value_clip: 0.1
+  entropy_loss_scale: 0.001
+  value_loss_scale: 1.0
+  kl_threshold: 0.0
+  advantage_filter_ratio: 0.0
+  rewards_shaper_scale: 1.0
+  time_limit_bootstrap: True
+  experiment:
+    directory: "mappo_hebbnet"
+    experiment_name: ""
+    write_interval: 100
+    checkpoint_interval: 25000  # 60 checkpoints over 1.5M steps
+
+
+trainer:
+  class: SequentialTrainer
+  timesteps: 1500000
+  environment_info: log
