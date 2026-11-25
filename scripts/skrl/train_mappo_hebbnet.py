@@ -40,6 +40,9 @@ parser.add_argument("--policy_lr", type=float, default=None, help="policy learni
 parser.add_argument("--value_lr", type=float, default=None, help="value learning rate (cfg: 1e-4)")
 parser.add_argument("--timesteps", type=int, default=None, help="env steps per drone (cfg: 1.5M)")
 parser.add_argument("--checkpoint_interval", type=int, default=None, help="steps between checkpoints (cfg: 25000)")
+parser.add_argument("--checkpoint", type=str, default=None,
+                    help="resume from this agent_<step>.pt (policy, critic, optimizers and input statistics); "
+                         "the step count starts again from 0 in a new log folder")
 parser.add_argument("--tag", type=str, default="", help="appended to the log folder name")
 parser.add_argument("--cfg", type=str, default=None, help="agent yaml (default: agents/skrl_mappo_hebbnet_cfg.yaml)")
 AppLauncher.add_app_launcher_args(parser)
@@ -132,6 +135,9 @@ def main():
     env = gym.make(args_cli.task, cfg=env_cfg)
     env = SkrlVecEnvWrapper(env, ml_framework="torch")
     runner = Runner(env, agent_cfg)
+    if args_cli.checkpoint:
+        runner.agent.load(os.path.abspath(args_cli.checkpoint))
+        print(f"[mappo_hebbnet] resumed from {args_cli.checkpoint}", flush=True)
     pol = runner.agent.policies[env.possible_agents[0]]
     print("[mappo_hebbnet] policy parameters:",
           {k: tuple(v.shape) for k, v in pol.state_dict().items()}, flush=True)

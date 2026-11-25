@@ -72,6 +72,9 @@ def load(folder):
                 load_tilt=np.degrees(np.arccos(np.clip(Rl[:, 2, 2], -1, 1))),
                 goal_tilt=float(np.degrees(np.arccos(np.clip(Rg[0, 2, 2], -1, 1)))),
                 rew=d["rew_terms"][:n, e] if has_rew else None))
+    Tm = max(f["T"] for f in fl)          # an episode can stop early once every swarm crashed: use the full length
+    for f in fl:
+        f["T"] = Tm
     return fl, rew_names
 
 
@@ -159,7 +162,8 @@ def orientation(fl, out):
         w.writerow(["t_s", "tilt_med", "tilt_q25", "tilt_q75", "yaw_med", "yaw_q25", "yaw_q75"])
         for i in range(0, T, 5):
             w.writerow([round(r[i], 4) for r in rows])
-    slope = np.polyfit(gt, lt, 1)[0] if len(gt) > 2 else np.nan
+    # no slope when every flight asks the same tilt (e.g. the hold test or the normal task: tilt 0 asked)
+    slope = np.polyfit(gt, lt, 1)[0] if len(gt) > 2 and np.ptp(gt) > 1e-3 else np.nan
     print(f"  orientation: final median tilt error {np.median([f['tilt'][-1] for f in full]):.0f}°, "
           f"yaw error {np.median([f['yaw'][-1] for f in full]):.0f}°; payload tilt reached vs asked: slope {slope:.2f}, "
           f"mean tilt reached {lt.mean():.0f}° for {gt.mean():.0f}° asked")

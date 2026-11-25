@@ -18,9 +18,18 @@
 # Then (plain python3): diagnose_replay.py and plot_freeze.py on those folders (commands in the chat).
 
 # Edit this list to replay other runs (task i replays RUNS[i]; set --array to 0-(number of runs - 1)).
-RUNS=(results/3246978_A2_orient
-      results/3247651_B1_gmean45
-      results/3247895_B1_gmax45)
+RUNS=(results/3262177_E1_fuda_curr_omninxt
+      results/3262384_E1_fuda_falcon
+      results/3262387_E1_fuda_curr_falcon
+      results/3262390_E1_fuda_omninxt
+      results/3259572_D1_orient_warm
+      results/3257757_D1_orient_pw2
+      results/3259552_D1_orient
+      results/3253785_C1_orient
+      results/mappo_falcon_lr5e-5
+      results/mappo_falcon_lr3e-4
+      results/mappo_omninxt_lr5e-5
+      results/mappo_omninxt_lr3e-4)
 i=$SLURM_ARRAY_TASK_ID
 RUN=${RUNS[$i]}
 [ -n "$RUN" ] && [ -f "$RUN/theta.npy" ] || { echo "task $i: no run (found ${#RUNS[@]}: ${RUNS[*]})"; exit 1; }

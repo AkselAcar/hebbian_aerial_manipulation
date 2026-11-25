@@ -35,8 +35,8 @@ def gen_of(folder):
     return int(m.group(1)) if m else -1
 
 
-def extra(folder):
-    """|acc command| and drone tilt, (flights, T) with NaN after the crash."""
+def extra(folder, T):
+    """|acc command| and drone tilt, (flights, T) with NaN after the crash (episodes padded to T steps)."""
     acc, tilt = [], []
     for f in sorted(f for f in glob.glob(os.path.join(folder, "ep*.npz")) if os.path.basename(f)[2:-4].isdigit()):
         d = np.load(f)
@@ -49,12 +49,13 @@ def extra(folder):
         else:
             tl = np.full(a.shape, np.nan)
         a[~al], tl[~al] = np.nan, np.nan
-        acc.append(a.T); tilt.append(tl.T)
+        pad = ((0, 0), (0, T - a.shape[0]))      # an episode can stop early once every swarm has crashed
+        acc.append(np.pad(a.T, pad, constant_values=np.nan)); tilt.append(np.pad(tl.T, pad, constant_values=np.nan))
     return np.concatenate(acc), np.concatenate(tilt)
 
 
 def curve(fl, key):
-    T = fl[0]["T"]
+    T = max(f["T"] for f in fl)
     M = np.full((len(fl), T), np.nan)
     for i, f in enumerate(fl):
         v = f[key]
@@ -75,10 +76,10 @@ def main():
     rows = []
     for i, (g, folder) in enumerate(runs):
         fl, _ = load(folder)
-        dt, T = fl[0]["dt"], fl[0]["T"]
+        dt, T = fl[0]["dt"], max(f["T"] for f in fl)
         t = np.arange(T) * dt
         col = cmap(i / max(len(runs) - 1, 1))
-        acc, tilt = extra(folder)
+        acc, tilt = extra(folder, T)
         with np.errstate(all="ignore"):
             for k, M in enumerate([curve(fl, "pos"), curve(fl, "att"), acc, tilt]):
                 ax[k].plot(t, np.nanmedian(M, 0), color=col, lw=1.6, label=f"gen {g}")

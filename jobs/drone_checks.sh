@@ -38,15 +38,19 @@ run() {
     "
 }
 
+ONLY=${1:-all}    # sbatch jobs/drone_checks.sh 1   -> only test 1
 echo "=== 1. pipeline check: Falcon, re-converted USD ==="
 run scripts/hebbian/replay_hebbian.py --headless --results_dir $RUN --which theta --num_envs 32 --n_episodes 2 \
     --lr 0.001 --drone falcon --robot_usd $FALCON_USD
+[ "$ONLY" = 1 ] && exit 0
 echo "=== 2. hover test, OmniNxt ==="
 run scripts/hebbian/replay_hebbian.py --headless --results_dir $RUN --zero_action --num_envs 32 --n_episodes 1 \
     --drone omninxt
+[ "$ONLY" = 1 ] && exit 0
 echo "=== 3. 3219114 on the OmniNxt ==="
 run scripts/hebbian/replay_hebbian.py --headless --results_dir $RUN --which theta --num_envs 32 --n_episodes 2 \
     --lr 0.001 --drone omninxt
+[ "$ONLY" = 1 ] && exit 0
 echo "=== 4. tiny training, OmniNxt ==="
 run scripts/hebbian/train_hebbian.py --headless --pop_size=8 --n_reps=1 --n_generations=2 --episode_steps=300 \
     --genome=w_abcd --optimizer=openai_es --es_optimizer=adam --sigma0=0.05 --es_lr=0.01 --weight_decay=0.005 \
